@@ -1,0 +1,15 @@
+# Built player (download it from Releases, or build it with player-src\build.bat)
+*.exe
+
+# Harness output (text snapshots)
+tools/out/
+
+# Work in progress: classic-game modules still under review (not built into the HTML)
+src-anims/*-gx-*.js
+
+# Editor / OS clutter
+*.tmp
+*.bak
+Thumbs.db
+desktop.ini
+node_modules/
