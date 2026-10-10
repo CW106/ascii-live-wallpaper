@@ -187,6 +187,7 @@
       "ix-lightning": {"name":"Lightning Cursor","desc":"Lightning strikes from the clouds toward the cursor; click to call down a thunderbolt"},
       "ix-rain": {"name":"Digital Rain Umbrella","desc":"Digital rain parts around the cursor as if it were an umbrella; click to ripple drops away"},
       "ix-paint": {"name":"Neon Doodle","desc":"Move the mouse to draw glowing neon lines that fade and change color; hold for thick lines"},
+      "ix-fog": {"name":"Foggy Window","desc":"Hold the mouse button to draw on the fogged glass and see outside; scroll for finger size"},
     },
     variants: {
       "matrix.hex": {"name":"Hex Rain","desc":"Columns of two-digit hexadecimal bytes rain down"},
@@ -1069,6 +1070,8 @@
       "ix-rain.storm": {"name":"Storm","desc":"Denser, faster rain, and shaking the mouse left and right whips up the wind"},
       "ix-rain.sink": {"name":"Black Hole","desc":"The cursor pulls raindrops into orbit; click to blast every captured character back out"},
       "ix-paint.mirror": {"name":"Kaleidoscope","desc":"Every stroke is mirrored six ways around the center of the screen"},
+      "ix-fog.snow": {"name":"Snowy Dawn","desc":"A snowy forest and cabin at dawn: hold the mouse button to draw, scroll for finger size"},
+      "ix-fog.rain": {"name":"Rainy Corner","desc":"Neon and headlights blur in the fog on a rainy street: hold to draw; more drops run down"},
     },
   });
 })();

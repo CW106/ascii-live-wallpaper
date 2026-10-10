@@ -2,7 +2,7 @@
 
 [中文說明](README.md) · The interface switches between 中文 and English (the "中文 | EN" toggle at the top right, or "語言 / Language" in the tray menu).
 
-Turn your Windows desktop into **live ASCII character animations**: 1062 procedurally generated wallpapers, mini-games you play with the mouse right on the desktop, a ray-traced 3D Newton's cradle with 3D spatial sound, and a converter that turns your own images, GIFs and videos into ASCII wallpapers. It comes with its own wallpaper player — no Wallpaper Engine or Lively needed.
+Turn your Windows desktop into **live ASCII character animations**: 1065 procedurally generated wallpapers, mini-games you play with the mouse right on the desktop, a ray-traced 3D Newton's cradle with 3D spatial sound, a fogged-up window you can draw on, and a converter that turns your own images, GIFs and videos into ASCII wallpapers. It comes with its own wallpaper player — no Wallpaper Engine or Lively needed.
 
 ![Gallery](docs/gallery-en.png)
 
@@ -10,16 +10,16 @@ Turn your Windows desktop into **live ASCII character animations**: 1062 procedu
 
 | Part | What it does |
 |---|---|
-| Gallery | 1062 ASCII animations in 14 categories (Classics, Arcade, Puzzle, Interactive, Nature, Space, Geometry, Fractals, Life, Algorithms, Tech, Games, Scenes, Utilities); search, change the color theme, preview full screen, then set it as your wallpaper in one click |
-| Interactive wallpapers | 62 playable wallpapers: Whack-a-Mole, Brick Smasher, Paddle Duel, Fruit Slicer, Bubble Pop, Minefield, Four in a Row, Reversi, Gomoku, Sand Art, Click Fireworks, Life Canvas… Play them with the mouse while the cursor is over the desktop; when nobody plays, the computer plays a demo |
-| 3D Newton's cradle | Per-character ray tracing: chrome balls with reflections, shadows and perspective; real physics (pull out k balls and k balls fly out the other side); grab a ball with the mouse and let go; every clack is placed in 3D space (best with headphones) |
+| Gallery | 1065 ASCII animations in 14 categories (Classics, Arcade, Puzzle, Interactive, Nature, Space, Geometry, Fractals, Life, Algorithms, Tech, Games, Scenes, Utilities); search, change the color theme, preview full screen, then set it as your wallpaper in one click |
+| Interactive wallpapers | 65 playable wallpapers: Foggy Window (draw on the fogged glass), Whack-a-Mole, Brick Smasher, Paddle Duel, Fruit Slicer, Bubble Pop, Minefield, Four in a Row, Reversi, Gomoku, Sand Art, Click Fireworks, Life Canvas… Play them with the mouse while the cursor is over the desktop; when nobody plays, the computer plays a demo |
+| 3D Newton's cradle | Per-character ray tracing: chrome balls with reflections, shadows and perspective; real physics (pull out k balls and k balls fly out the other side); grab a ball with the mouse and let go, right-drag to rotate the view, scroll to zoom; every clack is placed in 3D space (best with headphones) |
 | Convert | Image, GIF and video to ASCII animation, with character sets, color themes and effects; export as GIF |
 | Saved / Playlist | Keep your converted wallpapers; rotate several wallpapers |
 | Wallpaper player | One wallpaper per monitor; pauses automatically when covered by windows, in full screen, when the PC is locked or the display is off (saves power, stays silent); sound on/off, language, start with Windows |
 
-| 3D Newton's cradle | Full-screen preview |
+| 3D Newton's cradle | Foggy Window |
 |---|---|
-| ![3D Newton's cradle](docs/cradle3d.png) | ![Viewer](docs/viewer-en.png) |
+| ![3D Newton's cradle](docs/cradle3d.png) | ![Foggy Window](docs/foggy-window.png) |
 
 ## Run it
 
@@ -34,7 +34,7 @@ The tray menu opens the manager, pauses, toggles sound, switches the language, c
 ### Playing the interactive wallpapers
 
 - Move the mouse over the desktop (any part not covered by a window): move, click, hold and drag, scroll.
-- Left button only. The keyboard is never used (so you can't accidentally rename desktop icons), and right-click still opens the normal desktop menu.
+- Mostly the left button. The keyboard is never used (so you can't accidentally rename desktop icons). Only wallpapers with a rotatable view, like the 3D Newton's cradle, use right-drag; a plain right-click still opens the normal desktop menu.
 - After about 6 seconds without input, the computer takes over again.
 
 ## Build it yourself
