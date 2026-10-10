@@ -594,6 +594,7 @@ namespace AsciiWallpaper
         {
             Program.Op = "sync-monitors";
             monitors = Mon.All();
+            InputForward.Streams.SetMonitors(monitors.Select(m => new KeyValuePair<string, Rectangle>(m.Id, m.Bounds))); // 滑鼠事件串流只接受接著的螢幕
             AdoptMovedWalls();
             foreach (var id in surfaces.Keys.ToList())
             {
@@ -624,6 +625,7 @@ namespace AsciiWallpaper
             s.Pending = true;
             s.FitLeft = s.FitTop = -1;
             s.LaunchedAt = DateTime.Now;
+            InputForward.SetRightDrag(s.Mon.Id, false);
             Program.Log("launch " + s.Mon.Id + " (" + s.Title + ")");
             try { Edge.Launch(Program.Origin + "/w/" + s.Mon.Id + "#wpid=" + s.Mon.Id, s.Mon.Bounds); }
             catch (Exception e) { Program.Log("edge launch failed: " + e.Message); }
@@ -790,7 +792,16 @@ namespace AsciiWallpaper
         void UpdateInputTargets()
         {
             InputForward.SetTargets(surfaces.Values.Where(s => s.Embedded && s.Hwnd != IntPtr.Zero)
-                .Select(s => new InputForward.Target { Bounds = s.Mon.Bounds, Hwnd = s.Hwnd }));
+                .Select(s => new InputCore.Target { Id = s.Mon.Id, Bounds = s.Mon.Bounds, Hwnd = s.Hwnd, Host = s.HostAlive ? s.Host.Handle : IntPtr.Zero, Scale = Native.MonitorScale(s.Mon.Bounds) }));
+            UpdateInputActive();
+        }
+
+        // 滑鼠掛鉤只在需要時裝著：至少一個桌布放進了桌面、正在播放（沒有全部暫停、沒被蓋住而自動暫停、沒有鎖定 / 關螢幕）。
+        // 暫停中的桌布不會動，轉送過去也沒用；全螢幕遊戲之類蓋住桌布時，系統的每個滑鼠事件就不必先繞到我們這裡
+        void UpdateInputActive()
+        {
+            bool away = locked || displayOff;
+            InputForward.SetActive(!exiting && !away && !settings.Paused && surfaces.Values.Any(s => s.Embedded && s.Hwnd != IntPtr.Zero && !s.AutoPaused));
         }
 
         // 之前蓋住螢幕的視窗是不是已經不再蓋住了（不用列舉所有視窗，很便宜）
@@ -842,6 +853,7 @@ namespace AsciiWallpaper
                 if (s.Covered) hush.Add(s.Mon.Id); // 自動暫停關掉時，被蓋住的螢幕照常播放、但不發聲
             }
             Hub.Publish(next, hush);
+            UpdateInputActive();
         }
 
         // 視窗切換、最小化 / 還原、拖曳結束、顯示 / 隱藏、切換虛擬桌面時由系統通知，不必等下一次定期檢查。
@@ -952,6 +964,7 @@ namespace AsciiWallpaper
                 settings.WallsEn.Remove(id);
                 settings.WallBounds.Remove(id);
                 settings.AdoptedFrom.Remove(id);
+                InputForward.SetRightDrag(id, false);
                 try { string p = Files.WallPath(id); if (File.Exists(p)) File.Delete(p); } catch (Exception e) { Program.Log("delete wall failed: " + e.Message); }
                 Program.Log("clear " + id);
             }
@@ -1018,6 +1031,7 @@ namespace AsciiWallpaper
             r["lang"] = I18n.Lang;          // 實際語言：zh / en
             r["langPref"] = I18n.PrefName;  // 設定：auto / zh / en
             r["away"] = locked || displayOff;
+            r["input"] = InputForward.Diag();   // 滑鼠轉送的診斷（只有視窗類別名稱和次數）
             r["monitors"] = monitors.Select(m =>
             {
                 Surface s; surfaces.TryGetValue(m.Id, out s);
@@ -1137,6 +1151,7 @@ namespace AsciiWallpaper
             checkSoon.Stop();
             foreach (var h in winHooks) Native.UnhookWinEvent(h);
             winHooks.Clear();
+            InputForward.Stop();
             msg.UnwatchAway();
             Program.Log("quit");
             foreach (var s in surfaces.Values)
@@ -1875,134 +1890,1193 @@ namespace AsciiWallpaper
 
     // ───────────────────────── 滑鼠轉送（互動桌布） ─────────────────────────
     // 桌布在桌面圖示後面，收不到滑鼠。游標在桌面上（不是在其他視窗上）時，把移動、左鍵、滾輪轉送給那個螢幕的桌布，
-    // 互動桌布（小遊戲）才玩得到。用 Raw Input（RIDEV_INPUTSINK）在自己的執行緒接收：
-    // 只是「旁聽」滑鼠，不像全域滑鼠掛鉤那樣會在播放器忙的時候拖慢整個系統的滑鼠
-    static class InputForward
+    // 互動桌布（小遊戲）才玩得到。頁面宣告要右鍵拖曳（rightDrag，例如轉動 3D 視角；/api/wait 帶 rd=1）的螢幕上也轉送右鍵。
+    // 用低階滑鼠掛鉤（WH_MOUSE_LL）在自己的執行緒接收。系統每個滑鼠事件都要等掛鉤回呼回來，所以回呼只做便宜的事：
+    // 先看游標在不在桌布的螢幕上，不寫檔、不等待（記錄檔交給執行緒集區寫），也盡量不配置記憶體。
+    // 掛鉤可能被系統悄悄拿掉（回呼逾時）或收不到事件（例如前景是系統管理員權限的視窗）：游標動了、掛鉤卻超過 500 ms
+    // 沒有任何事件時，改成約 60 Hz 輪詢（GetCursorPos + GetAsyncKeyState）並重新安裝掛鉤，掛鉤一有事件就停止輪詢。
+    // 掛鉤和輪詢在同一條執行緒、走同一個狀態機：每個移動 / 按下 / 放開只轉送一次，順序不變。
+    // 左鍵一律放行（桌面圖示照常能點、能拖）；右鍵只在宣告 rightDrag 的螢幕上、從桌面按下時才攔下並轉送，
+    // 沒有拖曳的單純右鍵點擊（移動 < 6 px，按多久都算）放開後用 SendInput 補送一次真的右鍵點擊，桌面的右鍵選單照常出現。
+    // 只有至少一個桌布放進了桌面、而且正在播放（沒有暫停、沒被視窗蓋住而自動暫停、沒有鎖定或關螢幕）時才裝掛鉤，其他時候拆掉：
+    // 例如玩全螢幕遊戲時，系統的每個滑鼠事件就不必先繞到我們這裡。
+
+    // 輸入轉送用到的系統呼叫：正式執行用 Win32InputSys，測試程式換成假的
+    interface IInputSys
     {
-        public class Target { public Rectangle Bounds; public IntPtr Hwnd; }
-        static volatile Target[] targets = new Target[0];
-        public static void SetTargets(IEnumerable<Target> t) { targets = t.ToArray(); }
+        int Now();                                   // 毫秒（任意起點、會繞回；只拿來算差）
+        IntPtr WindowFromPoint(Point p);
+        IntPtr Root(IntPtr h);                       // GetAncestor GA_ROOT
+        IntPtr Parent(IntPtr h);                     // GetAncestor GA_PARENT
+        string ClassOf(IntPtr h);
+        bool ScreenToClient(IntPtr h, ref Native.POINT p);
+        bool Post(IntPtr h, int msg, IntPtr w, IntPtr l);
+        bool CursorPos(out Point p);
+        bool KeyDown(int vk);                        // GetAsyncKeyState：實體按鍵（左右對調時要自己換）
+        bool Swapped();                              // SM_SWAPBUTTON
+        void Log(string line);                       // 不能卡住呼叫的執行緒
+    }
 
-        const int WM_INPUT = 0x00FF, WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_MOUSEWHEEL = 0x020A;
-        const int MK_LBUTTON = 0x0001;
-        static Target downTarget;            // 左鍵在哪個桌布上按下（放開時一定送回同一個，拖到別的視窗上放開也一樣）
-        static Point lastPos = new Point(int.MinValue, int.MinValue);
-        static int lastMoveAt;
-
-        public static void Start()
+    class Win32InputSys : IInputSys
+    {
+        // 用高精度計時器：Environment.TickCount 一格 15.6 ms，「每 8 ms 送一次移動」「約 60 Hz 輪詢」會變成一半
+        static readonly long ticksPerMs = Math.Max(1, Stopwatch.Frequency / 1000);
+        public int Now() { return unchecked((int)(Stopwatch.GetTimestamp() / ticksPerMs)); }
+        public IntPtr WindowFromPoint(Point p) { return WindowFromPointW(p); }
+        public IntPtr Root(IntPtr h) { return Native.GetAncestor(h, 2 /* GA_ROOT */); }
+        public IntPtr Parent(IntPtr h) { return Native.GetAncestor(h, 1 /* GA_PARENT */); }
+        // 類別名稱：只在輸入執行緒上用。緩衝區重複使用，最近看過的名稱直接沿用同一個字串，平常完全不配置記憶體
+        readonly char[] clsBuf = new char[256];
+        readonly string[] clsSeen = new string[16];
+        int clsNext;
+        public string ClassOf(IntPtr h)
         {
-            var t = new Thread(() =>
+            int n = GetClassNameW(h, clsBuf, clsBuf.Length);
+            if (n <= 0) return "";
+            for (int i = 0; i < clsSeen.Length; i++)
             {
-                try
-                {
-                    var w = new Sink();
-                    var dev = new RAWINPUTDEVICE[] { new RAWINPUTDEVICE { usUsagePage = 0x01, usUsage = 0x02, dwFlags = 0x00000100 /* RIDEV_INPUTSINK */, hwndTarget = w.Handle } };
-                    if (!RegisterRawInputDevices(dev, 1, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)))) { Program.Log("raw input register failed: " + Marshal.GetLastWin32Error()); return; }
-                    Application.Run();
-                }
-                catch (Exception e) { Program.Log("input thread failed: " + e); }
-            }) { IsBackground = true, Name = "input" };
-            t.SetApartmentState(ApartmentState.STA);
-            t.Start();
-        }
-
-        // 只收訊息的隱藏視窗
-        class Sink : NativeWindow
-        {
-            public Sink() { CreateHandle(new CreateParams { Parent = new IntPtr(-3) /* HWND_MESSAGE */ }); }
-            protected override void WndProc(ref Message m)
-            {
-                if (m.Msg == WM_INPUT) { try { OnRawInput(m.LParam); } catch (Exception) { } }
-                base.WndProc(ref m);
+                string c = clsSeen[i];
+                if (c == null || c.Length != n) continue;
+                int k = 0;
+                while (k < n && c[k] == clsBuf[k]) k++;
+                if (k == n) return c;
             }
+            string s = new string(clsBuf, 0, n);
+            clsSeen[clsNext] = s;
+            clsNext = (clsNext + 1) % clsSeen.Length;
+            return s;
         }
+        public bool ScreenToClient(IntPtr h, ref Native.POINT p) { return ScreenToClientW(h, ref p); }
+        public bool Post(IntPtr h, int msg, IntPtr w, IntPtr l) { return PostMessageW(h, msg, w, l); }
+        public bool CursorPos(out Point p) { return GetCursorPos(out p); }
+        public bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+        public bool Swapped() { return GetSystemMetrics(23 /* SM_SWAPBUTTON */) != 0; }
+        // 記錄檔的鎖最多會等 3 秒：輸入執行緒不能等，交給執行緒集區
+        public void Log(string line) { ThreadPool.QueueUserWorkItem(_ => Program.Log(line)); }
 
-        static readonly byte[] buf = new byte[64];
-        static void OnRawInput(IntPtr hRaw)
+        [DllImport("user32.dll", EntryPoint = "WindowFromPoint")] static extern IntPtr WindowFromPointW(Point p);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetClassNameW")] static extern int GetClassNameW(IntPtr h, [Out] char[] buf, int n);
+        [DllImport("user32.dll", EntryPoint = "ScreenToClient")] static extern bool ScreenToClientW(IntPtr h, ref Native.POINT p);
+        [DllImport("user32.dll", EntryPoint = "PostMessageW")] static extern bool PostMessageW(IntPtr h, int msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point p);
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+        [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+    }
+
+    // 轉送的狀態機（只在輸入執行緒上執行；SetTargets / SetRightDrag / Diag 可以從其他執行緒呼叫）
+    class InputCore
+    {
+        public class Target { public string Id = ""; public Rectangle Bounds; public IntPtr Hwnd, Host; public double Scale = 1; }
+
+        public const int WM_MOUSEMOVE = 0x0200, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_RBUTTONDOWN = 0x0204, WM_RBUTTONUP = 0x0205, WM_MOUSEWHEEL = 0x020A;
+        public const int MK_LBUTTON = 0x0001, MK_RBUTTON = 0x0002, VK_LBUTTON = 0x01, VK_RBUTTON = 0x02;
+        // 我們自己補送的右鍵點擊（SendInput 的 dwExtraInfo）："ASCIWPRC"；掛鉤看到它就原封不動放行
+        public static readonly IntPtr Magic = IntPtr.Size == 8 ? new IntPtr(0x4153434957505243L) : new IntPtr(0x57505243);
+        public const int MoveIntervalMs = 8;     // 移動最多每 8 ms 轉送一次（最後的位置一定會送到）
+        public const int SilentMs = 500;         // 游標動了、掛鉤卻這麼久沒有事件 → 改用輪詢
+        public const int LiveCheckMs = 250;      // 平常多久檢查一次掛鉤是否還活著
+        public const int PollMs = 15, SlowPollMs = 50, SlowAfterMs = 10000; // 輪詢間隔（系統計時器一格 15.6 ms：15 → 約 64 Hz）；10 秒沒變化就放慢
+        public const int ReinstallMs = 5000;     // 輪詢期間多久重新安裝一次掛鉤
+        public const double ClickMaxPx = 6;      // 右鍵從按下到放開都沒移動這麼遠（以 100% 縮放計；按多久都一樣）＝單純的右鍵點擊：補送給桌面
+        public const int RdStaleMs = 40000;      // 頁面一直留著一個 /api/wait（最多 25 秒就重問；連著串流時每 20 秒問一次）：這麼久沒來、也沒連著串流＝頁面當掉或卡住了，不再攔右鍵
+
+        readonly IInputSys sys;
+        // 桌布頁面連著的滑鼠事件串流（/api/input）。null = 只張貼訊息（測試用）。啟動輸入執行緒之前設定
+        public InputStreams Streams;
+        public InputCore(IInputSys sys)
         {
-            uint size = (uint)buf.Length;
-            var h = GCHandle.Alloc(buf, GCHandleType.Pinned);
-            try
-            {
-                if (GetRawInputData(hRaw, 0x10000003 /* RID_INPUT */, h.AddrOfPinnedObject(), ref size, (uint)(IntPtr.Size == 8 ? 24 : 16)) == unchecked((uint)-1)) return;
-            }
-            finally { h.Free(); }
-            if (BitConverter.ToUInt32(buf, 0) != 0 /* RIM_TYPEMOUSE */) return;
-            int hdr = IntPtr.Size == 8 ? 24 : 16;
-            ushort btn = BitConverter.ToUInt16(buf, hdr + 4);
-            short wheel = BitConverter.ToInt16(buf, hdr + 6);
+            this.sys = sys;
+            int now = sys.Now();
+            lastHookAt = lastLive = lastPoll = lastPollChange = lastReinstall = summaryAt = now;
+            lastMoveAt = now - MoveIntervalMs;
             Point p;
-            if (!GetCursorPos(out p)) return;
-            if ((btn & 0x0001) != 0) Send("down", p, 0);           // RI_MOUSE_LEFT_BUTTON_DOWN
-            if ((btn & 0x0002) != 0) Send("up", p, 0);             // RI_MOUSE_LEFT_BUTTON_UP
-            if ((btn & 0x0400) != 0) Send("wheel", p, wheel);      // RI_MOUSE_WHEEL
-            if (p != lastPos && unchecked(Environment.TickCount - lastMoveAt) >= 8) { lastPos = p; lastMoveAt = Environment.TickCount; Send("move", p, 0); }
+            if (sys.CursorPos(out p)) livePos = cursor = p;
         }
 
-        // 測試用：把指定的螢幕座標當成游標位置送一次（不檢查游標底下是不是桌面）
-        public static bool Inject(string type, int x, int y)
+        // ── 桌布視窗（UI 執行緒每秒更新；內容沒變就沿用同一份） ──
+        volatile Target[] targets = new Target[0];
+        public void SetTargets(IEnumerable<Target> list)
         {
-            var p = new Point(x, y);
-            var t = TargetAt(p);
-            if (t == null) return false;
-            Post(t, type == "down" ? WM_LBUTTONDOWN : type == "up" ? WM_LBUTTONUP : WM_MOUSEMOVE, type == "down" ? MK_LBUTTON : 0, p);
-            return true;
+            var next = list.ToArray();
+            var cur = targets;
+            bool same = next.Length == cur.Length;
+            for (int i = 0; same && i < next.Length; i++)
+                same = next[i].Id == cur[i].Id && next[i].Bounds == cur[i].Bounds && next[i].Hwnd == cur[i].Hwnd && next[i].Host == cur[i].Host && next[i].Scale == cur[i].Scale;
+            if (!same) targets = next;
         }
-
-        static Target TargetAt(Point p)
+        public Target TargetAt(Point p)
         {
-            foreach (var t in targets) if (t.Bounds.Contains(p) && IsWindow(t.Hwnd)) return t;
+            var ts = targets;
+            for (int i = 0; i < ts.Length; i++) if (ts[i].Bounds.Contains(p)) return ts[i];
             return null;
         }
 
-        // 游標底下是桌面（桌面圖示層或桌布層），不是其他程式的視窗
-        static bool OverDesktop(Point p)
+        // ── 每個螢幕的頁面要不要右鍵拖曳（HTTP 執行緒在每次 /api/wait 記下：頁面要、而且沒有暫停；換桌布時清掉）。
+        //    多了新的螢幕才換一份新的字典，讀的人不用鎖。頁面超過 RdStaleMs 沒來輪詢（當掉、卡住）就當作不要 ──
+        class RdState { public volatile bool On; public volatile int At; }
+        readonly object rdGate = new object();
+        volatile Dictionary<string, RdState> rd = new Dictionary<string, RdState>();
+        int rdChanges;
+        public void SetRightDrag(string mon, bool on)
         {
-            IntPtr w = WindowFromPoint(p);
-            if (w == IntPtr.Zero) return false;
-            IntPtr root = Native.GetAncestor(w, 2 /* GA_ROOT */);
-            string cls = Native.ClassOf(root == IntPtr.Zero ? w : root);
-            return cls == "Progman" || cls == "WorkerW";
+            if (string.IsNullOrEmpty(mon)) return;
+            int now = sys.Now();
+            lock (rdGate)
+            {
+                RdState st;
+                if (!rd.TryGetValue(mon, out st))
+                {
+                    st = new RdState { At = now };
+                    var next = new Dictionary<string, RdState>(rd);
+                    next[mon] = st;
+                    rd = next;
+                }
+                st.At = now;
+                if (st.On != on) { st.On = on; rdChanges++; }
+            }
+        }
+        // 頁面連著滑鼠事件串流時不會一直留著 /api/wait（只在連上、收到 wake 時和每 20 秒來問一次），串流連著就算是活著的
+        public bool RightDrag(string mon)
+        {
+            RdState st;
+            if (mon == null || !rd.TryGetValue(mon, out st) || !st.On) return false;
+            var ss = Streams;
+            return unchecked(sys.Now() - st.At) < RdStaleMs || (ss != null && ss.Has(mon));
         }
 
-        static void Send(string type, Point p, int wheel)
+        // ── 要不要轉送（UI 執行緒依「有沒有桌布放在桌面上、正在播放」決定；輸入執行緒照著裝上 / 拆掉掛鉤） ──
+        volatile bool want;
+        bool active;                   // 只在輸入執行緒上讀寫
+        int activeChanges;
+        public bool SetWant(bool on) { if (want == on) return false; want = on; return true; }
+        public bool Active { get { return active; } }
+
+        // 輸入執行緒每次醒來先呼叫：1 = 要裝掛鉤，-1 = 要拆掉，0 = 不變
+        public int SyncActive()
         {
-            if (type == "up")
+            if (want == active) return 0;
+            int now = sys.Now();
+            if (!active)
             {
-                var d = downTarget;
-                downTarget = null;
-                if (d != null && IsWindow(d.Hwnd)) Post(d, WM_LBUTTONUP, 0, p);
-                return;
+                active = true; activeChanges++;
+                // 從現在重新判斷掛鉤是否活著（停用期間沒有事件不算失效）
+                lastHookAt = lastLive = now; liveEvents = hookEvents;
+                Point p;
+                if (sys.CursorPos(out p)) livePos = cursor = p;
+                return 1;
             }
-            if (!OverDesktop(p)) return;
-            var t = TargetAt(p);
+            if (rEaten) return 0;   // 被吞掉的右鍵按下還沒放開：留著掛鉤，放開也要吞掉（桌面才不會收到沒有按下的放開而跳出選單）
+            // 停用：還按著（轉送中）的鍵送一個放開給頁面，游標所在的桌布送「離開」，狀態全部歸零
+            movePending = false;
+            if (lT != null) { Target s = lT; lT = null; if (Post(s, WM_LBUTTONUP, Keys(s), cursor, now)) fwdLUp++; }
+            if (rT != null) { Target s = rT; rT = null; if (Post(s, WM_RBUTTONUP, Keys(s), cursor, now)) fwdRUp++; }
+            LeaveNow(cursor);
+            lKnown = rKnown = false; rOrphan = false; fallback = false; wantReinstall = false;
+            active = false; activeChanges++;
+            return -1;
+        }
+
+        // ── 狀態（只在輸入執行緒上讀寫） ──
+        Target lT, rT;                 // 左鍵 / 右鍵在哪個桌布上按下（轉送中）；放開時一定送回同一個，拖到別的地方放開也一樣
+        bool rEaten;                   // 這次右鍵按下被掛鉤吞掉了：放開也要吞掉
+        bool lKnown, rKnown;           // 目前知道的主要 / 次要按鍵狀態（掛鉤或輪詢看到的），輪詢拿來比對
+        Point rDownPt; long rMaxD2;
+        Point cursor, pendingPos, sentPos;
+        bool movePending; int lastMoveAt; IntPtr sentHwnd; int sentKeys = -1;
+        int lastHookAt, liveEvents; Point livePos;   // 上一次檢查掛鉤時的游標位置、掛鉤事件數
+        bool fallback; int lastLive, lastPoll, lastPollChange, lastReinstall;
+        bool rOrphan;                  // 被吞掉的右鍵按下是輪詢放開的（掛鉤當時失效）：掛鉤之後收到的那個放開也要吞掉
+        bool wantReinstall, replayPending; Point replayAt;
+        IntPtr hitHwnd; int hitAt; bool hitOver;   // 上一次判斷「游標底下是不是桌面」的結果（同一個視窗 1 秒內沿用）
+        Target inT;                    // 游標目前在哪個桌布上（最後收到事件、還沒送「離開」的）；離開只從串流送
+        IntPtr postedL, postedR;       // 按住中的左鍵 / 右鍵的「按下」張貼給了哪個 Edge 視窗：放開也一定張貼給它（串流在按住途中連上時，Edge 自己的按鍵狀態才不會卡住）
+
+        // ── 診斷（/api/status 的 input；只有類別名稱和次數） ──
+        int seenMove, seenLDown, seenLUp, seenRDown, seenRUp, seenWheel, seenOther, seenInjected, seenOurs, hookEvents;
+        int pollMove, pollLDown, pollLUp, pollRDown, pollRUp, polls;
+        int fwdMove, fwdLDown, fwdLUp, fwdRDown, fwdRUp, fwdWheel, fwdLeave, postFail, posted, streamed;
+        int eatRDown, eatRUp, eatOrphan, replayReq, replays, replayFail, replayErr, repairs;
+        int activations, recoveries, hookInstalls, hookFails, hookErr, hitChecks, faults, wakeups;
+        volatile bool hookOk, pmv2;
+        volatile string hitCls = "", hitRoot = "", lastTarget = "", lastFault = "";
+        int lastFwdAt; bool anyFwd;
+        readonly Dictionary<string, int> rejects = new Dictionary<string, int>(); // 游標在桌布螢幕上、但底下是別的視窗：最上層視窗的類別 → 次數
+        int summaryAt, seenOnlyAt; string lastKey = ""; int lastSeenTotal;
+
+        // ── 掛鉤的每一個事件（系統等著它回來）。回傳 true = 吞掉，桌面和其他程式都收不到 ──
+        public bool OnHook(int msg, Point p, int mouseData, int flags, IntPtr extra)
+        {
+            int now = sys.Now();
+            lastHookAt = now; hookEvents++;
+            if (fallback) { fallback = false; recoveries++; }   // 掛鉤又有事件了：停止輪詢
+            if (extra == Magic) { seenOurs++; return false; }    // 我們自己補送的右鍵點擊
+            if ((flags & 1 /* LLMHF_INJECTED */) != 0) seenInjected++;
+            switch (msg)
+            {
+                case WM_MOUSEMOVE: seenMove++; Move(p, now); return false;
+                case WM_LBUTTONDOWN: seenLDown++; return Button(false, true, p, now, true);
+                case WM_LBUTTONUP: seenLUp++; return Button(false, false, p, now, true);
+                case WM_RBUTTONDOWN: seenRDown++; return Button(true, true, p, now, true);
+                case WM_RBUTTONUP: seenRUp++; return Button(true, false, p, now, true);
+                case WM_MOUSEWHEEL: seenWheel++; Wheel(p, (short)((mouseData >> 16) & 0xFFFF), now); return false;
+                default: seenOther++; return false;
+            }
+        }
+
+        void Move(Point p, int now)
+        {
+            cursor = p;
+            if (rT != null) Stretch(p);
+            if (lT == null && rT == null && TargetAt(p) == null) { movePending = false; if (inT != null) LeaveNow(p); return; } // 便宜的範圍檢查：不在任何桌布的螢幕上
+            pendingPos = p;
+            movePending = true;
+            if (unchecked(now - lastMoveAt) >= MoveIntervalMs) FlushMove(now);
+        }
+
+        void Stretch(Point p)
+        {
+            long dx = p.X - rDownPt.X, dy = p.Y - rDownPt.Y, d2 = dx * dx + dy * dy;
+            if (d2 > rMaxD2) rMaxD2 = d2;
+        }
+
+        // 送出最新的游標位置：按著轉送中的按鍵時一律送給那個桌布（拖出桌面也一樣），否則只在游標在桌面上時送
+        void FlushMove(int now)
+        {
+            if (!movePending) return;
+            movePending = false;
+            lastMoveAt = now;
+            Point p = pendingPos;
+            Target t = lT ?? rT;
+            if (t == null)
+            {
+                t = TargetAt(p);
+                if (t == null || !OverDesktop(p, now)) { sentHwnd = IntPtr.Zero; LeaveNow(p); return; }
+                Enter(t, p);
+            }
+            int keys = Keys(t);
+            if (p == sentPos && t.Hwnd == sentHwnd && keys == sentKeys) return;
+            if (Post(t, WM_MOUSEMOVE, keys, p, now)) fwdMove++;
+        }
+
+        int Keys(Target t)
+        {
+            if (t == null) return 0;
+            return (lT != null && lT.Hwnd == t.Hwnd ? MK_LBUTTON : 0) | (rT != null && rT.Hwnd == t.Hwnd ? MK_RBUTTON : 0);
+        }
+
+        // right：次要（邏輯右鍵）/ 主要（邏輯左鍵）。hook：掛鉤看到的（可以吞掉）或輪詢看到的（不行）
+        bool Button(bool right, bool down, Point p, int now, bool hook)
+        {
+            cursor = p;
+            FlushMove(now);   // 之前延後的移動先送，順序才對
+            if (!right)
+            {
+                lKnown = down;
+                if (down)
+                {
+                    if (lT != null) { Target s = lT; lT = null; repairs++; if (Post(s, WM_LBUTTONUP, Keys(s), p, now)) fwdLUp++; } // 漏掉了上一次的放開：先補一個
+                    Target t = TargetAt(p);
+                    if (t == null || (rT != null && rT.Hwnd != t.Hwnd) || !OverDesktop(p, now)) return false; // 不是在桌面上按下的：這次按住都不轉送
+                    if (rT == null) Enter(t, p);
+                    lT = t;
+                    if (Post(t, WM_LBUTTONDOWN, Keys(t), p, now)) fwdLDown++;
+                    return false;   // 左鍵一律放行
+                }
+                if (lT == null) return false;
+                Target d = lT;
+                lT = null;
+                if (Post(d, WM_LBUTTONUP, Keys(d), p, now)) fwdLUp++;
+                LeaveIfOutside(p, now);
+                return false;
+            }
+            rKnown = down;
+            if (down) rOrphan = false;   // 新的按下（掛鉤或輪詢看到的）：之前被輪詢放開的那次，它真的放開已經過去了（掛鉤當時沒看到）
+            if (hook && rOrphan)
+            {
+                rOrphan = false;
+                // 掛鉤失效時被輪詢放開的右鍵，掛鉤恢復後才收到它真的放開：吞掉，不然桌面會收到沒有按下的放開而跳出右鍵選單
+                if (!down) { eatOrphan++; return true; }
+            }
+            if (down)
+            {
+                if (rT != null) { Target s = rT; rT = null; rEaten = false; repairs++; if (Post(s, WM_RBUTTONUP, Keys(s), p, now)) fwdRUp++; }
+                Target t = TargetAt(p);
+                // 沒宣告右鍵拖曳的螢幕：右鍵完全不碰
+                if (t == null || !RightDrag(t.Id) || (lT != null && lT.Hwnd != t.Hwnd) || !OverDesktop(p, now)) return false;
+                if (lT == null) Enter(t, p);
+                rT = t; rEaten = hook; rDownPt = p; rMaxD2 = 0;
+                if (Post(t, WM_RBUTTONDOWN, Keys(t), p, now)) fwdRDown++;
+                if (hook) eatRDown++;
+                return hook;
+            }
+            if (rT == null) return false;
+            Target r = rT;
+            bool eaten = rEaten;
+            Stretch(p);
+            rT = null; rEaten = false;
+            if (Post(r, WM_RBUTTONUP, Keys(r), p, now)) fwdRUp++;
+            LeaveIfOutside(p, now);
+            if (eaten && !hook) rOrphan = true;  // 掛鉤沒看到放開（失效了）：它恢復後收到的放開要吞掉
+            if (!eaten || !hook) return false;   // 按下時沒吞（輪詢看到的）：放開也照常放行
+            eatRUp++;
+            if (IsClick(rMaxD2, r.Scale)) { replayPending = true; replayAt = rDownPt; replayReq++; }
+            return true;
+        }
+
+        // 單純的右鍵點擊（不是拖曳）：放開後補送給桌面，右鍵選單照常出現。只看移動距離、不看按了多久：Windows 的右鍵點擊沒有時間限制，
+        // 右鍵拖曳的頁面也只用拖曳（原地按住什麼都不做），慢慢按的右鍵點擊不補送的話，桌面的右鍵選單就會「有時候沒反應」
+        public static bool IsClick(long maxD2, double scale)
+        {
+            double lim = ClickMaxPx * Math.Max(1, scale);
+            return maxD2 < lim * lim;
+        }
+
+        // delta：WM_MOUSEWHEEL 的值（正 = 往前推、離開使用者 = 往上捲）
+        void Wheel(Point p, int delta, int now)
+        {
+            FlushMove(now);
+            Target t = TargetAt(p);
+            if (t == null || !OverDesktop(p, now)) return;
+            if (lT == null && rT == null) Enter(t, p);
+            if (Deliver(t, WM_MOUSEWHEEL, Keys(t), p, delta, now)) fwdWheel++;
+        }
+
+        bool Post(Target t, int msg, int keys, Point screen, int now)
+        {
+            if (!Deliver(t, msg, keys, screen, 0, now)) return false;
+            sentPos = screen; sentHwnd = t.Hwnd; sentKeys = keys;   // 按鍵訊息也算：之後同一點、同樣按鍵的移動不必再送
+            return true;
+        }
+
+        // 送給桌布頁面：這個螢幕有頁面連著滑鼠事件串流（/api/input）就從串流送，而且不張貼訊息（不會重複）；
+        // 沒有串流（舊版頁面、頁面還在載入、串流斷了）時照舊張貼給 Edge 視窗。
+        // 串流的座標是相對於螢幕左上角的實際像素、滾輪 dy 和 DOM 的 deltaY 同號（= -delta）；
+        // 張貼的座標是 Edge 視窗用戶區的實際像素（Edge 自己會依螢幕縮放比例換算；實測 200% 的螢幕也正確），WM_MOUSEWHEEL 則是螢幕座標
+        bool Deliver(Target t, int msg, int keys, Point screen, int wheel, int now)
+        {
+            var st = Streams;
+            bool stream = st != null && st.Has(t.Id), post = !stream, ok = false;
+            // 按下是張貼的，放開也張貼（串流連著時頁面不理會 DOM 事件，只是讓 Edge 的按鍵狀態一致）
+            if (msg == WM_LBUTTONDOWN) postedL = IntPtr.Zero;
+            else if (msg == WM_RBUTTONDOWN) postedR = IntPtr.Zero;
+            else if (msg == WM_LBUTTONUP) { if (postedL == t.Hwnd) post = true; postedL = IntPtr.Zero; }
+            else if (msg == WM_RBUTTONUP) { if (postedR == t.Hwnd) post = true; postedR = IntPtr.Zero; }
+            if (stream)
+            {
+                byte type = msg == WM_MOUSEMOVE ? InputStreams.Move : msg == WM_MOUSEWHEEL ? InputStreams.Wheel
+                    : msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ? InputStreams.Down : InputStreams.Up;
+                int b = msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ? 2 : 0;
+                if (st.Send(t.Id, type, screen.X - t.Bounds.X, screen.Y - t.Bounds.Y, b, -wheel, keys)) { ok = true; streamed++; }
+                else post = true;   // 剛好斷線：照舊張貼
+            }
+            if (post)
+            {
+                bool sent;
+                if (msg == WM_MOUSEWHEEL) sent = sys.Post(t.Hwnd, msg, new IntPtr((wheel << 16) | keys), PackXY(screen.X, screen.Y));
+                else
+                {
+                    var pt = new Native.POINT { X = screen.X, Y = screen.Y };
+                    sent = sys.ScreenToClient(t.Hwnd, ref pt) && sys.Post(t.Hwnd, msg, new IntPtr(keys), PackXY(pt.X, pt.Y));
+                }
+                if (sent)
+                {
+                    ok = true; posted++;
+                    if (msg == WM_LBUTTONDOWN) postedL = t.Hwnd; else if (msg == WM_RBUTTONDOWN) postedR = t.Hwnd;
+                }
+                else postFail++;
+            }
+            if (ok) Note(t, now);
+            return ok;
+        }
+
+        // 游標移到桌布 t 上：之前在別的桌布上（沒按著鍵）就先告訴那一頁游標離開了
+        void Enter(Target t, Point p)
+        {
+            if (inT != null && inT.Id != t.Id) LeaveNow(p);
+            inT = t;
+        }
+
+        // 游標離開了桌面 / 這個螢幕（沒按著鍵）：從串流送「離開」（張貼沒有對應的訊息，舊版頁面照舊收不到）
+        void LeaveNow(Point p)
+        {
+            Target t = inT;
             if (t == null) return;
-            if (type == "down") { downTarget = t; Post(t, WM_LBUTTONDOWN, MK_LBUTTON, p); }
-            else if (type == "wheel")
-            {
-                // WM_MOUSEWHEEL 的座標是螢幕座標
-                PostMessage(t.Hwnd, WM_MOUSEWHEEL, new IntPtr((wheel << 16) | (downTarget != null ? MK_LBUTTON : 0)), new IntPtr(((p.Y & 0xFFFF) << 16) | (p.X & 0xFFFF)));
-            }
-            else Post(t, WM_MOUSEMOVE, downTarget != null ? MK_LBUTTON : 0, p);
+            inT = null;
+            sentHwnd = IntPtr.Zero;   // 回到同一點也要重送移動
+            var st = Streams;
+            if (st != null && st.Send(t.Id, InputStreams.Leave, p.X - t.Bounds.X, p.Y - t.Bounds.Y, 0, 0, 0)) { fwdLeave++; streamed++; }
         }
 
-        // 座標是 Edge 視窗用戶區的實際像素（Edge 自己會依螢幕縮放比例換算；實測 200% 的螢幕也正確）
-        static void Post(Target t, int msg, int keys, Point screen)
+        // 放開最後一個按著的鍵時，游標已經不在那個桌布的桌面上（拖到別的視窗、螢幕外才放開）：送「離開」
+        void LeaveIfOutside(Point p, int now)
         {
-            var pt = new Native.POINT { X = screen.X, Y = screen.Y };
-            if (!ScreenToClient(t.Hwnd, ref pt)) return;
-            PostMessage(t.Hwnd, msg, new IntPtr(keys), new IntPtr(((pt.Y & 0xFFFF) << 16) | (pt.X & 0xFFFF)));
+            if (inT == null || lT != null || rT != null) return;
+            Target h = TargetAt(p);
+            if (h == null || h.Id != inT.Id || !OverDesktop(p, now)) LeaveNow(p);
+        }
+        void Note(Target t, int now) { lastFwdAt = now; anyFwd = true; lastTarget = t.Id; }
+        public static IntPtr PackXY(int x, int y) { return new IntPtr(((y & 0xFFFF) << 16) | (x & 0xFFFF)); }
+
+        // 游標底下是桌面（不是其他程式的視窗、工作列、選單、通知……）
+        bool OverDesktop(Point p, int now)
+        {
+            IntPtr w = sys.WindowFromPoint(p);
+            if (w != IntPtr.Zero && w == hitHwnd && unchecked(now - hitAt) < 1000) return hitOver;
+            hitHwnd = w; hitAt = now; hitChecks++;
+            string cls = "", rcls = "";
+            bool ours = false;
+            if (w != IntPtr.Zero)
+            {
+                cls = sys.ClassOf(w);
+                IntPtr root = sys.Root(w);
+                rcls = root == IntPtr.Zero || root == w ? cls : sys.ClassOf(root);
+                if (!IsDesktopRoot(rcls)) ours = IsOurs(w);
+            }
+            hitOver = IsDesktopHit(rcls, ours);
+            hitCls = cls; hitRoot = rcls;
+            if (!hitOver)
+                lock (rejects)
+                {
+                    string k = rcls == "" ? "(none)" : rcls;
+                    int n;
+                    if (rejects.TryGetValue(k, out n)) rejects[k] = n + 1; else if (rejects.Count < 24) rejects[k] = 1;
+                }
+            return hitOver;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        struct RAWINPUTDEVICE { public ushort usUsagePage, usUsage; public uint dwFlags; public IntPtr hwndTarget; }
-        [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] devs, uint n, uint size);
-        [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr hRaw, uint cmd, IntPtr data, ref uint size, uint headerSize);
-        [DllImport("user32.dll")] static extern bool GetCursorPos(out Point p);
-        [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point p);
-        [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr h, ref Native.POINT p);
-        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
-        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+        // 桌面的兩個最上層視窗：Progman（桌布層、圖示層 SHELLDLL_DefView / SysListView32 都在它底下）、
+        // WorkerW（舊版 Windows 的桌布層；按 Win+D 之後圖示層也可能在它底下）
+        public static bool IsDesktopRoot(string rootCls) { return rootCls == "Progman" || rootCls == "WorkerW"; }
+        // 只看最上層視窗：檔案總管視窗裡也有 SHELLDLL_DefView、WorkerW 子視窗，最上層是 CabinetWClass，不算
+        public static bool IsDesktopHit(string rootCls, bool ours) { return ours || IsDesktopRoot(rootCls); }
+
+        // 我們自己的桌布視窗（Edge 視窗、它的子視窗、容器）
+        bool IsOurs(IntPtr w)
+        {
+            var ts = targets;
+            for (int depth = 0; w != IntPtr.Zero && depth < 8; depth++, w = sys.Parent(w))
+                for (int i = 0; i < ts.Length; i++)
+                    if (w == ts[i].Hwnd || (ts[i].Host != IntPtr.Zero && w == ts[i].Host)) return true;
+            return false;
+        }
+
+        // ── 迴圈每次醒來都呼叫：送出延後的移動、檢查掛鉤是否還活著、需要時輪詢 ──
+        public void Tick()
+        {
+            int now = sys.Now();
+            wakeups++;
+            if (!active) { if (unchecked(now - summaryAt) >= 60000) Summary(now); return; }
+            if (movePending && unchecked(now - lastMoveAt) >= MoveIntervalMs) FlushMove(now);
+            if (fallback)
+            {
+                if (unchecked(now - lastPoll) >= PollInterval(now)) Poll(now);
+                if (unchecked(now - lastReinstall) >= ReinstallMs) { lastReinstall = now; wantReinstall = true; }
+            }
+            else if (unchecked(now - lastLive) >= LiveCheckMs)
+            {
+                lastLive = now;
+                Point p;
+                if (sys.CursorPos(out p))
+                {
+                    // 游標從上次檢查到現在動了，這段時間掛鉤卻沒有任何事件（而且已經超過 500 ms）：掛鉤失效（或收不到），
+                    // 改用輪詢並重新安裝掛鉤。比的是兩次 GetCursorPos（掛鉤回報的位置在螢幕邊緣可能沒被夾住，不能拿來比）
+                    bool moved = p != livePos, silent = hookEvents == liveEvents && unchecked(now - lastHookAt) > SilentMs;
+                    livePos = p; liveEvents = hookEvents;
+                    if (moved && silent)
+                    {
+                        fallback = true; activations++;
+                        lastReinstall = now; wantReinstall = true; lastPollChange = now;
+                        Poll(now);
+                    }
+                }
+            }
+            if (unchecked(now - summaryAt) >= 60000) Summary(now);
+        }
+
+        int PollInterval(int now) { return unchecked(now - lastPollChange) > SlowAfterMs ? SlowPollMs : PollMs; }
+
+        void Poll(int now)
+        {
+            lastPoll = now; polls++;
+            Point p;
+            if (!sys.CursorPos(out p)) return;   // 例如鎖定畫面
+            livePos = p; liveEvents = hookEvents;
+            if (p != cursor) { lastPollChange = now; pollMove++; Move(p, now); }
+            bool sw = sys.Swapped();
+            bool prim = sys.KeyDown(sw ? VK_RBUTTON : VK_LBUTTON), sec = sys.KeyDown(sw ? VK_LBUTTON : VK_RBUTTON);
+            if (prim != lKnown) { lastPollChange = now; if (prim) pollLDown++; else pollLUp++; Button(false, prim, p, now, false); }
+            // 被掛鉤吞掉的右鍵：實體狀態看不到「按下」，只能看到放開
+            if (rEaten) { if (!sec) { lastPollChange = now; pollRUp++; Button(true, false, p, now, false); } }
+            else if (sec != rKnown) { lastPollChange = now; if (sec) pollRDown++; else pollRUp++; Button(true, sec, p, now, false); }
+        }
+
+        // 下次最晚什麼時候要醒來（毫秒）
+        public int NextWaitMs()
+        {
+            if (replayPending || wantReinstall) return 0;
+            if (!active) return 1000;   // 停用中：要開始時 UI 執行緒會叫醒我們
+            int now = sys.Now();
+            int w = fallback ? PollInterval(now) - unchecked(now - lastPoll) : LiveCheckMs - unchecked(now - lastLive);
+            if (movePending) w = Math.Min(w, MoveIntervalMs - unchecked(now - lastMoveAt));
+            return Math.Max(0, Math.Min(w, 1000));
+        }
+
+        public bool Fallback { get { return fallback; } }
+        public bool TakeReplay(out Point at) { at = replayAt; if (!replayPending) return false; replayPending = false; return true; }
+        public bool TakeReinstall() { if (!wantReinstall) return false; wantReinstall = false; return true; }
+
+        // 補送結束（SetCursorPos 把游標移回按下的位置不會經過掛鉤：記下來，免得被當成掛鉤失效）
+        public void ReplayDone(bool ok, int err, Point cursorNow)
+        {
+            if (ok) replays++; else { replayFail++; replayErr = err; }
+            livePos = cursorNow;
+        }
+
+        public void HookInstalled(bool ok, int err, bool threadPmv2)
+        {
+            pmv2 = threadPmv2;
+            if (ok) hookInstalls++; else { hookFails++; hookErr = err; }
+            // 第一次安裝、或之前一直失敗後終於裝上時寫一行（輪詢期間每 5 秒重裝一次，不必每次都寫）
+            bool log = hookInstalls + hookFails == 1 || (ok && !hookOk && hookFails > 0 && hookInstalls == 1);
+            hookOk = ok;
+            if (log) sys.Log("input: " + (ok ? "低階滑鼠掛鉤已安裝" : "低階滑鼠掛鉤安裝失敗 error " + err + "（游標移動時改用輪詢）") + "，PMv2=" + threadPmv2);
+        }
+
+        public void HookRemoved() { hookOk = false; }
+
+        public void Fault(Exception e)
+        {
+            faults++;
+            lastFault = e.GetType().Name + ": " + e.Message;
+            if (faults == 1) sys.Log("input: 轉送失敗 " + e);
+        }
+
+        // 每分鐘最多一行：轉送 / 攔截 / 補送 / 輪詢 / 掛鉤 / 錯誤有變化才寫；
+        // 只看到滑鼠事件、卻什麼都沒轉送（例如判斷不是桌面）時，最多每 10 分鐘寫一行，方便查「完全沒反應」
+        void Summary(int now)
+        {
+            summaryAt = now;
+            string key = fwdMove + "," + fwdLDown + "," + fwdLUp + "," + fwdRDown + "," + fwdRUp + "," + fwdWheel + "," + postFail + "," + eatRDown + "," + eatRUp + "," + eatOrphan
+                + "," + replayReq + "," + replayFail + "," + activations + "," + polls + "," + hookInstalls + "," + hookFails + "," + faults + "," + rdChanges + "," + repairs + "," + activeChanges
+                + "," + fwdLeave + "," + posted + "," + streamed;
+            int seenTotal = seenMove + seenLDown + seenLUp + seenRDown + seenRUp + seenWheel;
+            bool changed = key != lastKey;
+            bool seenOnly = !changed && seenTotal != lastSeenTotal && unchecked(now - seenOnlyAt) >= 600000;
+            lastKey = key; lastSeenTotal = seenTotal;
+            if (!changed && !seenOnly) return;
+            if (seenOnly) seenOnlyAt = now;
+            string s = "hook " + (hookOk ? "ok" : active ? "off err " + hookErr : "off（沒有正在播放的桌布）") + " installs " + hookInstalls + "/" + hookFails
+                + "，active " + (active ? "on" : "off") + " ×" + activeChanges
+                + "，fallback " + (fallback ? "on" : "off") + " ×" + activations + " polls " + polls
+                + "，seen mv " + seenMove + " L " + seenLDown + "/" + seenLUp + " R " + seenRDown + "/" + seenRUp + " wh " + seenWheel + " ours " + seenOurs
+                + "，polled mv " + pollMove + " L " + pollLDown + "/" + pollLUp + " R " + pollRDown + "/" + pollRUp
+                + "，fwd mv " + fwdMove + " L " + fwdLDown + "/" + fwdLUp + " R " + fwdRDown + "/" + fwdRUp + " wh " + fwdWheel + " leave " + fwdLeave + " fail " + postFail
+                + "（posted " + posted + " streamed " + streamed + "，sse " + (Streams != null ? Streams.Brief() : "-") + "）"
+                + "，eaten R " + eatRDown + "/" + eatRUp + "，replays " + replays + "/" + replayReq + (replayFail > 0 ? " failed " + replayFail + " err " + replayErr : "")
+                + "，hit " + hitCls + "/" + hitRoot + " over=" + hitOver + "，rd " + RdText() + (faults > 0 ? "，faults " + faults + " " + lastFault : "");
+            sys.Log("input: " + s);
+        }
+
+        string RdText() { var r = rd; return r.Count == 0 ? "-" : string.Join(" ", r.Select(kv => kv.Key + "=" + (RightDrag(kv.Key) ? 1 : 0))); }
+
+        static Dictionary<string, object> D(params object[] kv)
+        {
+            var d = new Dictionary<string, object>();
+            for (int i = 0; i + 1 < kv.Length; i += 2) d[(string)kv[i]] = kv[i + 1];
+            return d;
+        }
+
+        public Dictionary<string, object> Diag()
+        {
+            int now = sys.Now();
+            Dictionary<string, int> rej;
+            lock (rejects) rej = new Dictionary<string, int>(rejects);
+            var c = cursor;
+            return D(
+                "hook", D("installed", hookOk, "active", active, "wanted", want, "activeChanges", activeChanges,
+                    "error", hookErr, "installs", hookInstalls, "fails", hookFails, "events", hookEvents,
+                    "lastEventAgoMs", unchecked(now - lastHookAt), "pmv2", pmv2),
+                "fallback", D("active", fallback, "activations", activations, "recoveries", recoveries, "polls", polls),
+                "seen", D("move", seenMove, "ldown", seenLDown, "lup", seenLUp, "rdown", seenRDown, "rup", seenRUp, "wheel", seenWheel,
+                    "other", seenOther, "injected", seenInjected, "ours", seenOurs),
+                "polled", D("move", pollMove, "ldown", pollLDown, "lup", pollLUp, "rdown", pollRDown, "rup", pollRUp),
+                "forwarded", D("move", fwdMove, "ldown", fwdLDown, "lup", fwdLUp, "rdown", fwdRDown, "rup", fwdRUp, "wheel", fwdWheel, "leave", fwdLeave, "failed", postFail),
+                // 轉送走哪條路：張貼給 Edge 視窗的訊息數、放進滑鼠事件串流的事件數（含 leave）
+                "delivered", D("posted", posted, "streamed", streamed),
+                "sse", Streams != null ? (object)Streams.Diag() : null,
+                "swallowed", D("rdown", eatRDown, "rup", eatRUp, "orphanRup", eatOrphan),
+                "rightClickReplays", D("requested", replayReq, "sent", replays, "failed", replayFail, "error", replayErr),
+                "repairs", repairs,
+                "wakeups", wakeups,
+                "cursor", D("x", c.X, "y", c.Y),
+                "hit", D("cls", hitCls, "root", hitRoot, "overDesktop", hitOver, "checks", hitChecks),
+                "rejectedRoots", rej.ToDictionary(kv => kv.Key, kv => (object)kv.Value),
+                "lastTarget", lastTarget,
+                "lastForwardAgoMs", anyFwd ? (object)unchecked(now - lastFwdAt) : null,
+                "lastForwardAt", anyFwd ? DateTime.Now.AddMilliseconds(-unchecked(now - lastFwdAt)).ToString("HH:mm:ss.fff") : null,
+                "rightDrag", rd.ToDictionary(kv => kv.Key, kv => (object)RightDrag(kv.Key)),
+                "rightDragWaitAgoMs", rd.ToDictionary(kv => kv.Key, kv => (object)unchecked(now - kv.Value.At)),
+                "rightDragChanges", rdChanges,
+                "targets", targets.Select(t => (object)D("id", t.Id, "x", t.Bounds.X, "y", t.Bounds.Y, "w", t.Bounds.Width, "h", t.Bounds.Height, "scale", t.Scale)).ToList(),
+                "faults", faults,
+                "lastException", lastFault);
+        }
+    }
+
+    // 輸入執行緒：安裝掛鉤、跑訊息迴圈、補送右鍵點擊
+    static class InputForward
+    {
+        public static readonly InputStreams Streams = new InputStreams();   // 桌布頁面的滑鼠事件串流（HTTP 伺服器收連線，Core 送事件）
+        public static InputCore Core = new InputCore(new Win32InputSys()) { Streams = Streams };   // 測試程式可以換成用假系統呼叫的
+        delegate IntPtr HookProc(int code, IntPtr w, IntPtr l);
+        static readonly HookProc proc = HookCallback;   // 留著參考：回呼函式才不會被回收
+        static IntPtr hook;
+        static volatile int threadId;
+        static readonly int ExtraOffset = IntPtr.Size == 8 ? 24 : 20;   // MSLLHOOKSTRUCT.dwExtraInfo
+
+        public static void SetTargets(IEnumerable<InputCore.Target> t) { Core.SetTargets(t); }
+        public static void SetRightDrag(string mon, bool on) { Core.SetRightDrag(mon, on); }
+        public static Dictionary<string, object> Diag() { return Core.Diag(); }   // 含滑鼠事件串流（sse）的診斷
+        // UI 執行緒：有沒有桌布放在桌面上、正在播放。變了就叫醒輸入執行緒去裝上 / 拆掉掛鉤
+        public static void SetActive(bool on)
+        {
+            if (!Core.SetWant(on)) return;
+            int id = threadId;
+            if (id != 0) PostThreadMessage(id, 0x8001 /* WM_APP + 1：只是叫醒 */, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        public static void Start()
+        {
+            // 優先權高一點：系統每個滑鼠事件都要等掛鉤回呼，電腦很忙時也不能讓整個系統的滑鼠變慢
+            var t = new Thread(Run) { IsBackground = true, Name = "input", Priority = ThreadPriority.Highest };
+            t.Start();
+        }
+
+        public static void Stop() { int id = threadId; if (id != 0) PostThreadMessage(id, 0x0012 /* WM_QUIT */, IntPtr.Zero, IntPtr.Zero); }
+
+        static void Run()
+        {
+            try
+            {
+                threadId = (int)Native.GetCurrentThreadId();
+                MSG m;
+                PeekMessage(out m, IntPtr.Zero, 0, 0, 0 /* PM_NOREMOVE：先建立這條執行緒的訊息佇列 */);
+                while (true)
+                {
+                    try
+                    {
+                        // 有正在播放的桌布才裝掛鉤，沒有就拆掉（SetActive 叫醒我們；保險起見每次醒來都比一次）
+                        int a = Core.SyncActive();
+                        if (a > 0) Install(); else if (a < 0) Remove();
+                    }
+                    catch (Exception e) { Core.Fault(e); }
+                    // 掛鉤回呼是「送來的訊息」：等待時要能被它叫醒（QS_ALLINPUT 含 QS_SENDMESSAGE），由 PeekMessage 執行
+                    MsgWaitForMultipleObjectsEx(0, IntPtr.Zero, (uint)Core.NextWaitMs(), 0x04FF /* QS_ALLINPUT */, 0x0004 /* MWMO_INPUTAVAILABLE */);
+                    while (PeekMessage(out m, IntPtr.Zero, 0, 0, 1 /* PM_REMOVE */))
+                        if (m.message == 0x0012 /* WM_QUIT */) { Remove(); return; }
+                    try
+                    {
+                        Core.Tick();
+                        Point at;
+                        if (Core.TakeReplay(out at)) Replay(at);
+                        if (Core.TakeReinstall() && Core.Active) Install();
+                    }
+                    catch (Exception e) { Core.Fault(e); }
+                }
+            }
+            catch (Exception e) { Program.Log("input thread failed: " + e); }
+        }
+
+        // 安裝（或重新安裝）掛鉤：系統可能已經悄悄拿掉舊的，重新裝一次最保險
+        static void Install()
+        {
+            if (hook != IntPtr.Zero) { UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
+            hook = SetWindowsHookEx(14 /* WH_MOUSE_LL */, proc, GetModuleHandle(null), 0);
+            Core.HookInstalled(hook != IntPtr.Zero, hook == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0, Pmv2());
+        }
+
+        static void Remove()
+        {
+            if (hook != IntPtr.Zero) { UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
+            Core.HookRemoved();
+        }
+
+        static bool Pmv2()
+        {
+            try { return AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), new IntPtr(-4)); } catch (Exception) { return false; }
+        }
+
+        internal static IntPtr HookCallback(int code, IntPtr w, IntPtr l)
+        {
+            if (code >= 0 && l != IntPtr.Zero)
+            {
+                bool eat = false;
+                try
+                {
+                    var p = new Point(Marshal.ReadInt32(l, 0), Marshal.ReadInt32(l, 4));
+                    eat = Core.OnHook(unchecked((int)w.ToInt64()), p, Marshal.ReadInt32(l, 8), Marshal.ReadInt32(l, 12), Marshal.ReadIntPtr(l, ExtraOffset));
+                }
+                catch (Exception e) { Core.Fault(e); }
+                if (eat) return new IntPtr(1);
+            }
+            return CallNextHookEx(hook, code, w, l);
+        }
+
+        // 補送一次真的右鍵點擊（在回呼外面做）：先把游標移回按下的位置（最多差幾個像素），選單才出現在按下的地方。
+        // SendInput 的按鍵是實體按鍵：左右鍵對調時，邏輯右鍵＝實體左鍵
+        static void Replay(Point at)
+        {
+            Point cur;
+            if (Win32InputSys.GetCursorPos(out cur) && cur != at) SetCursorPos(at.X, at.Y);
+            var inputs = BuildReplay(Win32InputSys.GetSystemMetrics(23 /* SM_SWAPBUTTON */) != 0);
+            uint n = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+            Core.ReplayDone(n == inputs.Length, n == inputs.Length ? 0 : Marshal.GetLastWin32Error(), at);
+        }
+
+        internal static INPUT[] BuildReplay(bool swapped)
+        {
+            uint down = swapped ? 0x0002u /* MOUSEEVENTF_LEFTDOWN */ : 0x0008u /* MOUSEEVENTF_RIGHTDOWN */;
+            uint up = swapped ? 0x0004u /* MOUSEEVENTF_LEFTUP */ : 0x0010u /* MOUSEEVENTF_RIGHTUP */;
+            return new[] {
+                new INPUT { type = 0 /* INPUT_MOUSE */, mi = new MOUSEINPUT { dwFlags = down, dwExtraInfo = InputCore.Magic } },
+                new INPUT { type = 0, mi = new MOUSEINPUT { dwFlags = up, dwExtraInfo = InputCore.Magic } } };
+        }
+
+        // 測試用（/api/debug/input）：把指定的螢幕座標當成游標位置直接送一次（不檢查游標底下是不是桌面，不經過狀態機）。
+        // 那個螢幕有頁面連著滑鼠事件串流時從串流送（螢幕沒有放進桌面的桌布也可以，方便單獨測試頁面），否則張貼給 Edge 視窗。
+        // type = move / down / up / rdown / rup / wheel / leave（leave 只有串流）；delta = WM_MOUSEWHEEL 的值（串流的 dy = -delta）
+        public static bool Inject(string type, int x, int y, int delta)
+        {
+            var p = new Point(x, y);
+            var t = Core.TargetAt(p);
+            var st = Core.Streams;
+            if (st != null)
+            {
+                string id = t != null ? t.Id : null;
+                Rectangle b = t != null ? t.Bounds : Rectangle.Empty;
+                if (id == null) id = st.MonitorAt(p, out b);
+                if (id != null && st.Has(id))
+                {
+                    bool r = type == "rdown" || type == "rup";
+                    byte ev = type == "wheel" ? InputStreams.Wheel : type == "leave" ? InputStreams.Leave : type == "down" || type == "rdown" ? InputStreams.Down
+                        : type == "up" || type == "rup" ? InputStreams.Up : InputStreams.Move;
+                    int k = type == "down" ? 1 : type == "rdown" ? 2 : 0;
+                    return st.Send(id, ev, x - b.X, y - b.Y, r ? 2 : 0, type == "wheel" ? -delta : 0, k);
+                }
+            }
+            if (t == null || !Native.IsWindow(t.Hwnd) || type == "leave") return false;
+            var sys = new Win32InputSys();
+            if (type == "wheel") return sys.Post(t.Hwnd, InputCore.WM_MOUSEWHEEL, new IntPtr(delta << 16), InputCore.PackXY(x, y));
+            int msg = type == "down" ? InputCore.WM_LBUTTONDOWN : type == "up" ? InputCore.WM_LBUTTONUP
+                : type == "rdown" ? InputCore.WM_RBUTTONDOWN : type == "rup" ? InputCore.WM_RBUTTONUP : InputCore.WM_MOUSEMOVE;
+            int keys = type == "down" ? InputCore.MK_LBUTTON : type == "rdown" ? InputCore.MK_RBUTTON : 0;
+            var pt = new Native.POINT { X = x, Y = y };
+            return sys.ScreenToClient(t.Hwnd, ref pt) && sys.Post(t.Hwnd, msg, new IntPtr(keys), InputCore.PackXY(pt.X, pt.Y));
+        }
+
+        [StructLayout(LayoutKind.Sequential)] internal struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)] internal struct INPUT { public uint type; public MOUSEINPUT mi; }
+        [StructLayout(LayoutKind.Sequential)] struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public Native.POINT pt; public uint lPrivate; }
+        [DllImport("user32.dll", SetLastError = true, EntryPoint = "SetWindowsHookExW")] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr mod, uint thread);
+        [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
+        [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr w, IntPtr l);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+        [DllImport("user32.dll", EntryPoint = "PeekMessageW")] static extern bool PeekMessage(out MSG m, IntPtr h, uint min, uint max, uint remove);
+        [DllImport("user32.dll")] static extern uint MsgWaitForMultipleObjectsEx(uint n, IntPtr handles, uint ms, uint wake, uint flags);
+        [DllImport("user32.dll", EntryPoint = "PostThreadMessageW")] static extern bool PostThreadMessage(int thread, uint msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+        [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll")] static extern IntPtr GetThreadDpiAwarenessContext();
+        [DllImport("user32.dll")] static extern bool AreDpiAwarenessContextsEqual(IntPtr a, IntPtr b);
+    }
+
+    // ───────────────────────── 滑鼠事件串流（給桌布頁面） ─────────────────────────
+    // 張貼的滑鼠訊息在放進桌面的 Edge 視窗上不可靠：Chromium 處理 WM_MOUSEWHEEL 時用 WindowFromPoint 找游標底下的視窗，
+    // 那是 explorer 的桌面圖示層（別的程序），滾輪就被丟掉；右鍵也常常沒反應。所以桌布頁面直接向播放器要滑鼠事件：
+    //   GET /api/input?mon=<螢幕 id> → 200 text/event-stream（Server-Sent Events；chunked，每個事件馬上送出）
+    //   每個事件一行 data: {"t":"move"|"down"|"up"|"wheel"|"leave","x":…,"y":…[,"b":0|2][,"dy":…],"k":…}
+    //     x, y：相對於那個螢幕左上角的實際像素（頁面自己除以 devicePixelRatio）
+    //     b：只有 down / up，0 = 左鍵（主要）、2 = 右鍵（次要）
+    //     dy：只有 wheel，每格 120，正 = 往使用者方向轉 = 往下捲（和 DOM 的 WheelEvent.deltaY 同號）
+    //     k：目前還按著的鍵，1 = 左、2 = 右
+    //     leave：游標離開了桌面 / 這個螢幕，而且沒有按著鍵
+    //   連上時先送 {"t":"hello","v":1}；每 15 秒送一行註解 ": ping"。
+    //   {"t":"wake"}：/api/wait 的答案（換了桌布、暫停、音效開關、語言）可能變了。串流連著時頁面不留著長輪詢，
+    //     而是連上時、收到 wake 時才用 /api/wait?nowait=1 問一次（見 Hub）：一頁只佔一條一直開著的連線。
+    // 只接受播放器自己的頁面（Host、Origin、Sec-Fetch-Site）；不認得的螢幕 → 404（舊版播放器也是 404：頁面就一直用 DOM 事件）。
+    // 所有桌布的 Edge 共用一個設定檔，Chromium 對同一個主機最多只開 6 條 HTTP/1.1 連線：最多 MaxMonitors（5）個螢幕同時有串流，
+    // 至少留一條給其他請求（/api/wait?nowait=1、/api/fit、重新載入）。更多螢幕的頁面拿到 503（頁面隔一陣子再試，
+    // 其間照舊用長輪詢和張貼的訊息），連線才不會全被串流佔住、其他請求永遠等不到。
+    // 一個螢幕可以同時有好幾個連線（重新載入時新舊重疊）。送什麼由 InputCore 決定，和張貼訊息時完全一樣；
+    // 某個螢幕有連線時 InputCore 就不張貼訊息給它的 Edge 視窗（不會重複），沒有連線時照舊張貼（舊版頁面、頁面還在載入）。
+    // 掛鉤回呼只把事件放進每個連線自己的佇列、叫醒它的寫入執行緒（不碰網路、不等待、不配置記憶體）；每個連線一條寫入執行緒，
+    // 卡住的連線拖不慢掛鉤和其他請求。佇列有上限：連線跟不上時先丟掉最舊的移動（按鍵、滾輪、離開一定送到）；
+    // 寫入卡住超過 5 秒就斷線（頁面的 EventSource 會自己重連）；對方關掉連線最多約 0.5 秒就發現。
+    struct InputEv { public byte T; public int X, Y, B, Dy, K; }
+
+    class InputStreams
+    {
+        public const byte Move = 1, Down = 2, Up = 3, Wheel = 4, Leave = 5, Wake = 6;
+        static readonly string[] TypeNames = { "", "move", "down", "up", "wheel", "leave", "wake" };
+        public const int QueueMax = 256;        // 一個連線等著送的事件超過這麼多：丟掉最舊的移動
+        public const int QueueHardMax = 4096;   // 全是按鍵 / 滾輪還超過這麼多：連線卡死了，斷線
+        public const int MaxPerMonitor = 8, MaxClients = 32;
+        public const int MaxMonitors = 5;       // 最多幾個螢幕同時有串流（Chromium 對同一個主機最多 6 條連線，留一條給其他請求）
+        public int PingMs = 15000;              // 每隔多久送一行 ": ping"
+        public int BlockedMs = 5000;            // 寫入卡住這麼久就斷線
+        public int AliveCheckMs = 500;          // 多久檢查一次對方是不是已經關掉連線
+
+        class Stats
+        {
+            public int Connects, Disconnects, DroppedMoves, Hello, Ping, MaxQueue;
+            public readonly int[] Sent = new int[7];
+            public string LastReason;
+        }
+
+        readonly object gate = new object();
+        volatile Dictionary<string, Client[]> byMon = new Dictionary<string, Client[]>();   // 有變化就換一份新的：掛鉤讀的時候不用鎖
+        readonly Dictionary<string, Stats> stats = new Dictionary<string, Stats>();
+        readonly Dictionary<string, int> reasons = new Dictionary<string, int>();
+        readonly Dictionary<string, int> refused = new Dictionary<string, int>();
+        volatile Dictionary<string, Rectangle> mons;   // 接著的螢幕（UI 執行緒更新）；null = 剛啟動還不知道：格式正確的 id 都接受
+        bool stopped;
+        int nextId;
+
+        // UI 執行緒：目前接著的螢幕。拔掉的螢幕上的連線一律關掉
+        public void SetMonitors(IEnumerable<KeyValuePair<string, Rectangle>> list)
+        {
+            var next = new Dictionary<string, Rectangle>();
+            foreach (var kv in list) next[kv.Key] = kv.Value;
+            mons = next;
+            var gone = new List<Client>();
+            lock (gate) foreach (var kv in byMon) if (!next.ContainsKey(kv.Key)) gone.AddRange(kv.Value);
+            foreach (var c in gone) c.Close("monitor gone");
+        }
+
+        public bool Known(string mon) { var m = mons; return m == null || m.ContainsKey(mon); }
+
+        // /api/debug/input 用：這一點在哪個螢幕上（沒有放進桌面的桌布也可以）
+        public string MonitorAt(Point p, out Rectangle bounds)
+        {
+            bounds = Rectangle.Empty;
+            var m = mons;
+            if (m != null) foreach (var kv in m) if (kv.Value.Contains(p)) { bounds = kv.Value; return kv.Key; }
+            return null;
+        }
+
+        // 這個螢幕有沒有頁面連著（掛鉤回呼裡呼叫：不鎖、不配置記憶體）
+        public bool Has(string mon)
+        {
+            Client[] cs;
+            if (mon == null || !byMon.TryGetValue(mon, out cs)) return false;
+            for (int i = 0; i < cs.Length; i++) if (cs[i].Closing == null) return true;
+            return false;
+        }
+
+        // 送一個事件給這個螢幕的所有連線（x, y 已經是相對於螢幕左上角）。回傳 false = 沒有連線，呼叫的人改用張貼
+        public bool Send(string mon, byte type, int x, int y, int b, int dy, int k)
+        {
+            Client[] cs;
+            if (mon == null || !byMon.TryGetValue(mon, out cs)) return false;
+            var e = new InputEv { T = type, X = x, Y = y, B = b, Dy = dy, K = k };
+            bool any = false;
+            for (int i = 0; i < cs.Length; i++) if (cs[i].Enqueue(ref e)) any = true;
+            return any;
+        }
+
+        // 任何執行緒（Hub）：/api/wait 的答案可能變了，叫所有連著的頁面來問一次（{"t":"wake"}；還沒送出的會合併成一個，不會被丟掉）
+        public void WakeAll()
+        {
+            foreach (var cs in byMon.Values)
+                for (int i = 0; i < cs.Length; i++) cs[i].Wake();
+        }
+
+        // HTTP 執行緒：接手這個連線。回傳 null = 成功（之後由它自己的寫入執行緒送出回應、關閉連線），否則是拒絕的原因
+        public string Open(string mon, TcpClient tcp, NetworkStream ns)
+        {
+            Client c, evict = null;
+            int live;
+            lock (gate)
+            {
+                if (stopped) return "stopped";
+                int total = 0;
+                foreach (var a in byMon.Values) total += a.Length;
+                if (total >= MaxClients) return "too many connections";
+                Client[] cur;
+                if (!byMon.TryGetValue(mon, out cur)) cur = new Client[0];
+                var alive = cur.Where(x => x.Closing == null).ToList();
+                // 這個螢幕已經有串流（重新載入時新舊重疊）一定接受；否則最多 MaxMonitors 個螢幕同時有串流
+                if (alive.Count == 0 && byMon.Count(kv => kv.Key != mon && kv.Value.Any(x => x.Closing == null)) >= MaxMonitors) return "too many monitors";
+                if (alive.Count >= MaxPerMonitor) evict = alive[0];   // 最舊的（通常是已經關掉、還沒發現的舊頁面）
+                c = new Client(this, mon, ++nextId, tcp, ns, StatsOf(mon));
+                var next = new Dictionary<string, Client[]>(byMon);
+                next[mon] = cur.Concat(new[] { c }).ToArray();
+                byMon = next;
+                c.St.Connects++;
+                live = alive.Count + 1 - (evict != null ? 1 : 0);
+            }
+            if (evict != null) evict.Close("evicted");
+            try
+            {
+                tcp.NoDelay = true;   // 小事件馬上送出，不等 Nagle
+                ns.WriteTimeout = BlockedMs;
+                new Thread(c.Run) { IsBackground = true, Name = "input stream " + mon, Priority = ThreadPriority.AboveNormal }.Start();
+            }
+            catch (Exception e) { c.Close("error"); Removed(c, "error", e.Message); return "error"; }
+            Program.Log("input stream: connect " + mon + " #" + c.Id + "（這個螢幕 " + live + " 個連線）");
+            return null;
+        }
+
+        Stats StatsOf(string mon)
+        {
+            Stats s;
+            if (!stats.TryGetValue(mon, out s)) stats[mon] = s = new Stats();
+            return s;
+        }
+
+        void Removed(Client c, string reason, string detail)
+        {
+            int left = 0;
+            lock (gate)
+            {
+                Client[] cur;
+                if (byMon.TryGetValue(c.Mon, out cur))
+                {
+                    var rest = cur.Where(x => x != c).ToArray();
+                    if (rest.Length != cur.Length)
+                    {
+                        var next = new Dictionary<string, Client[]>(byMon);
+                        if (rest.Length == 0) next.Remove(c.Mon); else next[c.Mon] = rest;
+                        byMon = next;
+                        c.St.Disconnects++;
+                        c.St.LastReason = reason;
+                        int n;
+                        reasons.TryGetValue(reason, out n);
+                        reasons[reason] = n + 1;
+                    }
+                    left = rest.Count(x => x.Closing == null);
+                }
+            }
+            Program.Log("input stream: disconnect " + c.Mon + " #" + c.Id + " " + reason + (detail != null ? "（" + detail + "）" : "")
+                + "，sent " + c.SentTotal + "，這個螢幕還有 " + left + " 個連線");
+        }
+
+        // HTTP 執行緒：拒絕的連線（403 / 404 / 405 / 503）次數
+        public void Refused(int status)
+        {
+            lock (gate) { string k = status.ToString(); int n; refused.TryGetValue(k, out n); refused[k] = n + 1; }
+        }
+
+        // 結束程式：關掉所有連線，之後不再接受
+        public void Shutdown()
+        {
+            var all = new List<Client>();
+            lock (gate) { stopped = true; foreach (var a in byMon.Values) all.AddRange(a); }
+            foreach (var c in all) c.Close("shutdown");
+        }
+
+        public Dictionary<string, object> Diag()
+        {
+            lock (gate)
+            {
+                var per = new Dictionary<string, object>();
+                foreach (var kv in stats)
+                {
+                    var s = kv.Value;
+                    Client[] cs;
+                    per[kv.Key] = new Dictionary<string, object> {
+                        { "clients", byMon.TryGetValue(kv.Key, out cs) ? cs.Count(x => x.Closing == null) : 0 },
+                        { "connects", s.Connects }, { "disconnects", s.Disconnects }, { "lastDisconnect", s.LastReason },
+                        { "sent", new Dictionary<string, object> { { "hello", s.Hello }, { "move", s.Sent[Move] }, { "down", s.Sent[Down] }, { "up", s.Sent[Up] },
+                            { "wheel", s.Sent[Wheel] }, { "leave", s.Sent[Leave] }, { "wake", s.Sent[Wake] }, { "ping", s.Ping } } },
+                        { "droppedMoves", s.DroppedMoves }, { "maxQueue", s.MaxQueue } };
+                }
+                return new Dictionary<string, object> {
+                    { "clients", byMon.ToDictionary(kv => kv.Key, kv => (object)kv.Value.Count(x => x.Closing == null)) },
+                    { "maxMonitors", MaxMonitors },
+                    { "monitors", per },
+                    { "disconnectReasons", reasons.ToDictionary(kv => kv.Key, kv => (object)kv.Value) },
+                    { "refused", refused.ToDictionary(kv => kv.Key, kv => (object)kv.Value) } };
+            }
+        }
+
+        // 記錄檔的摘要：每個螢幕「連線數/送出事件數/丟掉的移動/斷線次數」
+        public string Brief()
+        {
+            lock (gate)
+            {
+                if (stats.Count == 0) return "-";
+                return string.Join(" ", stats.Select(kv =>
+                {
+                    Client[] cs;
+                    int n = byMon.TryGetValue(kv.Key, out cs) ? cs.Count(x => x.Closing == null) : 0;
+                    return kv.Key + "=" + n + "/" + kv.Value.Sent.Sum() + "/" + kv.Value.DroppedMoves + "/" + kv.Value.Disconnects;
+                }));
+            }
+        }
+
+        class Client
+        {
+            public readonly string Mon;
+            public readonly int Id;
+            public readonly Stats St;
+            readonly InputStreams hub;
+            readonly TcpClient tcp;
+            readonly Socket sock;
+            readonly NetworkStream ns;
+            readonly object q = new object();
+            List<InputEv> pending = new List<InputEv>(64), spare = new List<InputEv>(64);
+            bool wake;                        // 要送一個 {"t":"wake"}（在 q 鎖裡讀寫；好幾次合併成一個）
+            public volatile string Closing;   // 不是 null = 要斷線了（原因）：不再收事件，也不算「連著」
+            public long SentTotal;
+
+            public Client(InputStreams hub, string mon, int id, TcpClient tcp, NetworkStream ns, Stats st)
+            {
+                this.hub = hub; Mon = mon; Id = id; this.tcp = tcp; this.ns = ns; St = st;
+                sock = tcp.Client;
+            }
+
+            // 掛鉤回呼（或 HTTP 執行緒）：放進佇列、叫醒寫入執行緒
+            public bool Enqueue(ref InputEv e)
+            {
+                lock (q)
+                {
+                    if (Closing != null) return false;
+                    if (pending.Count >= QueueMax)
+                    {
+                        // 跟不上了：丟掉最舊的移動；全是按鍵 / 滾輪就留著（太多才斷線）
+                        int i = 0;
+                        while (i < pending.Count && pending[i].T != Move) i++;
+                        if (i < pending.Count) { pending.RemoveAt(i); Interlocked.Increment(ref St.DroppedMoves); }
+                        else if (e.T == Move) { Interlocked.Increment(ref St.DroppedMoves); return true; }
+                        else if (pending.Count >= QueueHardMax) { Closing = "overflow"; Monitor.Pulse(q); return false; }
+                    }
+                    pending.Add(e);
+                    if (pending.Count > St.MaxQueue) St.MaxQueue = pending.Count;
+                    Monitor.Pulse(q);
+                    return true;
+                }
+            }
+
+            // 任何執行緒：叫醒頁面去問 /api/wait（送 {"t":"wake"}）
+            public void Wake()
+            {
+                lock (q)
+                {
+                    if (Closing != null) return;
+                    wake = true;
+                    Monitor.Pulse(q);
+                }
+            }
+
+            // 任何執行緒：要求斷線。卡在寫入的話關掉連線讓它馬上中斷
+            public void Close(string reason)
+            {
+                lock (q) { if (Closing == null) Closing = reason; Monitor.Pulse(q); }
+                try { sock.Close(); } catch (Exception) { }
+            }
+
+            // 寫入執行緒：送出回應標頭和 hello，之後把佇列裡的事件整批送出、定時送 ping、檢查對方是不是關掉了
+            public void Run()
+            {
+                string reason = "closed", detail = null;
+                var sb = new StringBuilder(1024);
+                try
+                {
+                    Write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n"
+                        + "Transfer-Encoding: chunked\r\nX-Content-Type-Options: nosniff\r\n\r\n" + Chunk("data: {\"t\":\"hello\",\"v\":1}\n\n"));
+                    Interlocked.Increment(ref St.Hello);
+                    int lastPing = Environment.TickCount, lastCheck = lastPing;
+                    while (true)
+                    {
+                        List<InputEv> batch = null;
+                        bool wakeNow;
+                        lock (q)
+                        {
+                            if (Closing == null && pending.Count == 0 && !wake)
+                            {
+                                int now0 = Environment.TickCount;
+                                int wait = Math.Min(hub.PingMs - unchecked(now0 - lastPing), hub.AliveCheckMs - unchecked(now0 - lastCheck));
+                                if (wait > 0) Monitor.Wait(q, wait);
+                            }
+                            if (Closing != null) { reason = Closing; break; }
+                            if (pending.Count > 0) { batch = pending; pending = spare; spare = batch; }
+                            wakeNow = wake;
+                            wake = false;
+                        }
+                        if (batch != null || wakeNow) { SendBatch(batch, wakeNow, sb); if (batch != null) batch.Clear(); }
+                        int now = Environment.TickCount;
+                        if (unchecked(now - lastPing) >= hub.PingMs) { Write(Chunk(": ping\n\n")); lastPing = now; Interlocked.Increment(ref St.Ping); }
+                        if (unchecked(now - lastCheck) >= hub.AliveCheckMs) { lastCheck = now; if (PeerClosed()) { reason = "closed"; break; } }
+                    }
+                }
+                catch (Exception e)
+                {
+                    reason = Closing ?? Classify(e);
+                    if (reason == "error") detail = e.GetType().Name + ": " + e.Message;
+                }
+                finally
+                {
+                    lock (q) { if (Closing == null) Closing = reason; }
+                    try { tcp.Close(); } catch (Exception) { }
+                    hub.Removed(this, reason, detail);
+                }
+            }
+
+            // batch：佇列裡的事件（可以是 null）；wakeNow：最後再加一個 {"t":"wake"}
+            void SendBatch(List<InputEv> batch, bool wakeNow, StringBuilder sb)
+            {
+                var inv = System.Globalization.CultureInfo.InvariantCulture;   // 負號一定是 "-"
+                sb.Clear();
+                int n = batch != null ? batch.Count : 0;
+                for (int i = 0; i < n; i++)
+                {
+                    var e = batch[i];
+                    sb.Append("data: {\"t\":\"").Append(TypeNames[e.T]).Append("\",\"x\":").Append(e.X.ToString(inv)).Append(",\"y\":").Append(e.Y.ToString(inv));
+                    if (e.T == Down || e.T == Up) sb.Append(",\"b\":").Append(e.B.ToString(inv));
+                    if (e.T == Wheel) sb.Append(",\"dy\":").Append(e.Dy.ToString(inv));
+                    sb.Append(",\"k\":").Append(e.K.ToString(inv)).Append("}\n\n");
+                }
+                if (wakeNow) sb.Append("data: {\"t\":\"wake\"}\n\n");
+                Write(Chunk(sb.ToString()));
+                for (int i = 0; i < n; i++) Interlocked.Increment(ref St.Sent[batch[i].T]);
+                if (wakeNow) Interlocked.Increment(ref St.Sent[InputStreams.Wake]);
+                SentTotal += n + (wakeNow ? 1 : 0);
+            }
+
+            // 內容全是 ASCII：字元數 = 位元組數
+            static string Chunk(string s) { return s.Length.ToString("X", System.Globalization.CultureInfo.InvariantCulture) + "\r\n" + s + "\r\n"; }
+
+            void Write(string s)
+            {
+                var b = Encoding.ASCII.GetBytes(s);
+                ns.Write(b, 0, b.Length);   // 卡住超過 BlockedMs（WriteTimeout）會丟出例外 → 斷線
+                ns.Flush();
+            }
+
+            // 對方關掉連線了嗎（可讀、卻沒有資料 = 收到 FIN）；EventSource 不會再送東西，萬一有就讀掉丟棄
+            bool PeerClosed()
+            {
+                if (!sock.Poll(0, SelectMode.SelectRead)) return false;
+                int n = sock.Available;
+                if (n == 0) return true;
+                var junk = new byte[Math.Min(n, 4096)];
+                sock.Receive(junk, junk.Length, SocketFlags.None);
+                return false;
+            }
+
+            static string Classify(Exception e)
+            {
+                var se = (e as SocketException) ?? (e.InnerException as SocketException);
+                if (se != null)
+                {
+                    if (se.SocketErrorCode == SocketError.TimedOut || se.SocketErrorCode == SocketError.WouldBlock) return "blocked";
+                    if (se.SocketErrorCode == SocketError.ConnectionReset || se.SocketErrorCode == SocketError.ConnectionAborted || se.SocketErrorCode == SocketError.Shutdown) return "closed";
+                }
+                if (e is ObjectDisposedException) return "closed";
+                return "error";
+            }
+        }
     }
 
     // ───────────────────────── 我的收藏 ─────────────────────────
@@ -2104,10 +3178,13 @@ namespace AsciiWallpaper
     }
 
     // ───────────────────────── 暫停狀態（長輪詢） ─────────────────────────
-    // 每個螢幕「該不該暫停」、桌布音效開關和介面語言：UI 執行緒更新，HTTP 執行緒在 /api/wait 等它改變
+    // 每個螢幕「該不該暫停」、桌布音效開關和介面語言：UI 執行緒更新，HTTP 執行緒在 /api/wait 等它改變。
+    // 有變化時除了叫醒等待中的 /api/wait，也從滑鼠事件串流送 {"t":"wake"}：串流連著的頁面不留著長輪詢，
+    // 收到 wake 才用 /api/wait?nowait=1 問一次（每頁只佔一條一直開著的連線，見 InputStreams）
     static class Hub
     {
         static readonly object gate = new object();
+        public static volatile InputStreams Streams;   // 送 wake 的串流：HTTP 伺服器的（它建立時設定）
         static Dictionary<string, bool> paused = new Dictionary<string, bool>();
         static HashSet<string> hush = new HashSet<string>(); // 被視窗蓋住、但沒暫停的螢幕（自動暫停關掉時）：照常播放、不發聲
         static bool sound = true;   // 桌布音效開關（所有螢幕共用）
@@ -2121,6 +3198,7 @@ namespace AsciiWallpaper
                 sound = on;
                 Monitor.PulseAll(gate); // 同 Poke：叫醒等待中的頁面
             }
+            Wake();
         }
 
         // 只有實際語言改變才叫醒等待中的頁面（設成一樣的值不會）
@@ -2132,6 +3210,7 @@ namespace AsciiWallpaper
                 lang = l;
                 Monitor.PulseAll(gate);
             }
+            Wake();
         }
 
         public static void Publish(Dictionary<string, bool> next, HashSet<string> nextHush)
@@ -2143,11 +3222,18 @@ namespace AsciiWallpaper
                 hush = nextHush;
                 Monitor.PulseAll(gate);
             }
+            Wake();
         }
 
-        public static void Poke() { lock (gate) Monitor.PulseAll(gate); }
+        public static void Poke() { lock (gate) Monitor.PulseAll(gate); Wake(); }
 
-        // 版本（換了桌布）、暫停狀態、音效開關或介面語言和頁面目前知道的不同時立刻回覆，否則等到改變或逾時。
+        // 這個螢幕現在該不該暫停（系統匣暫停、被蓋住、鎖定）
+        public static bool Paused(string mon) { lock (gate) { bool p; paused.TryGetValue(mon, out p); return p; } }
+
+        // 狀態已經改好（在鎖外）才叫醒串流連著的頁面：它們接著問到的一定是新的狀態
+        static void Wake() { var st = Streams; if (st != null) st.WakeAll(); }
+
+        // 版本（換了桌布）、暫停狀態、音效開關或介面語言和頁面目前知道的不同時立刻回覆，否則等到改變或逾時（timeoutMs = 0：立刻回覆）。
         // 音效開關是每個螢幕各自的：總開關打開、而且沒有被視窗蓋住。
         // s = null / l = null：舊版頁面沒有送音效開關 / 語言，當作一樣（不會因此一直立刻回覆、空轉）
         public static Dictionary<string, object> Wait(string mon, string v, bool p, bool? s, string l, int timeoutMs)
@@ -2178,23 +3264,35 @@ namespace AsciiWallpaper
         TcpListener listener;
         volatile bool stopped;
         const long MaxWallpaperBytes = 380L * 1024 * 1024, MaxSmallBody = 64 * 1024;
-        static readonly string[] Hosts = { "127.0.0.1:" + Program.Port, "localhost:" + Program.Port };
-        static readonly string[] Origins = { Program.Origin, "http://localhost:" + Program.Port };
+        readonly int port;
+        readonly string[] Hosts, Origins;
+        readonly InputStreams streams;   // 桌布頁面的滑鼠事件串流（/api/input）
 
-        public HttpServer(PlayerApp app) { this.app = app; }
+        public HttpServer(PlayerApp app) : this(app, Program.Port, null) { }
+        // 測試程式可以用別的連接埠、自己的串流
+        public HttpServer(PlayerApp app, int port, InputStreams streams)
+        {
+            this.app = app;
+            this.port = port;
+            this.streams = streams ?? InputForward.Streams;
+            Hub.Streams = this.streams;   // 狀態改變時從這些串流送 wake
+            Hosts = new[] { "127.0.0.1:" + port, "localhost:" + port };
+            Origins = new[] { "http://127.0.0.1:" + port, "http://localhost:" + port };
+        }
 
         public bool Start()
         {
-            try { listener = new TcpListener(IPAddress.Loopback, Program.Port); listener.Start(); }
+            try { listener = new TcpListener(IPAddress.Loopback, port); listener.Start(); }
             catch (SocketException e) { Program.Log("listen failed: " + e.Message); return false; }
             try { Native.SetHandleInformation(listener.Server.Handle, 1 /* HANDLE_FLAG_INHERIT */, 0); } catch (Exception) { }
             var t = new Thread(AcceptLoop) { IsBackground = true, Name = "http" };
             t.Start();
-            Program.Log("listening on " + Program.Origin);
+            Program.Log("listening on " + Origins[0]);
             return true;
         }
 
-        public void Stop() { stopped = true; try { listener.Stop(); } catch (Exception) { } }
+        // 停止接受連線，也關掉所有滑鼠事件串流
+        public void Stop() { stopped = true; try { listener.Stop(); } catch (Exception) { } streams.Shutdown(); }
 
         void AcceptLoop()
         {
@@ -2218,10 +3316,11 @@ namespace AsciiWallpaper
 
         void Handle(TcpClient c)
         {
+            bool handedOff = false;   // 滑鼠事件串流：連線交給串流自己的寫入執行緒，這裡不能關掉
             try
             {
-                using (c)
-                using (var ns = c.GetStream())
+                var ns = c.GetStream();
+                try
                 {
                     ns.ReadTimeout = 10000;
                     ns.WriteTimeout = 120000;
@@ -2231,6 +3330,11 @@ namespace AsciiWallpaper
                     try
                     {
                         res = Check(req);
+                        if (res == null && req.Path == "/api/input")
+                        {
+                            res = OpenInput(req, c, ns);
+                            if (res == null) { handedOff = true; return; }
+                        }
                         if (res == null)
                         {
                             long max = req.Method == "POST" && (req.Path == "/api/apply" || req.Path == "/api/saved/put") ? MaxWallpaperBytes : MaxSmallBody;
@@ -2252,9 +3356,32 @@ namespace AsciiWallpaper
                     catch (Exception e) { Program.Log("request " + req.Method + " " + req.Path + " failed: " + e.Message); res = Error(500, e.Message); }
                     Write(ns, res, req.Method == "HEAD");
                 }
+                finally { if (!handedOff) ns.Dispose(); }
             }
             catch (IOException) { } // 瀏覽器關掉或重新載入時中斷的連線（例如等待中的 /api/wait），不必記錄
             catch (Exception e) { Program.Log("http error: " + e.Message); }
+            finally { if (!handedOff) c.Close(); }
+        }
+
+        // GET /api/input?mon=<螢幕 id>：桌布頁面的滑鼠事件串流（見 InputStreams）。
+        // 只給播放器自己的頁面（Host 已經在 Check 檢查過；Origin 有的話必須是播放器自己、Sec-Fetch-Site 必須是 same-origin），
+        // 不認得的螢幕 → 404。回傳 null = 連線已經交給串流
+        Res OpenInput(Req r, TcpClient c, NetworkStream ns)
+        {
+            Res res = null;
+            string mon = Q(r, "mon") ?? "";
+            if (r.Method != "GET") res = Error(405, "method not allowed");
+            else if (!PrivateRead(r)) res = Error(403, "forbidden");
+            else if (!IsId(mon) || !streams.Known(mon)) res = Error(404, "not found");
+            else if (r.Length > 0) res = Error(400, "unexpected body");
+            else
+            {
+                string why = streams.Open(mon, c, ns);
+                if (why == null) return null;
+                res = Error(503, why);
+            }
+            streams.Refused(res.Status);
+            return res;
         }
 
         static Req ReadHead(Stream s)
@@ -2317,7 +3444,7 @@ namespace AsciiWallpaper
 
         static string StatusText(int s)
         {
-            switch (s) { case 200: return "OK"; case 204: return "No Content"; case 400: return "Bad Request"; case 403: return "Forbidden"; case 404: return "Not Found"; case 405: return "Method Not Allowed"; case 413: return "Payload Too Large"; default: return "Error"; }
+            switch (s) { case 200: return "OK"; case 204: return "No Content"; case 400: return "Bad Request"; case 403: return "Forbidden"; case 404: return "Not Found"; case 405: return "Method Not Allowed"; case 413: return "Payload Too Large"; case 503: return "Service Unavailable"; default: return "Error"; }
         }
 
         static string Q(Req r, string key)
@@ -2419,7 +3546,8 @@ namespace AsciiWallpaper
                 }
                 if (r.Path == "/api/wait")
                 {
-                    // 桌布頁面的長輪詢（只接受播放器自己的頁面）：換桌布、暫停狀態或音效開關改變時立刻回覆，否則最多等 25 秒
+                    // 桌布頁面的長輪詢（只接受播放器自己的頁面）：換桌布、暫停狀態或音效開關改變時立刻回覆，否則最多等 25 秒。
+                    // nowait=1：立刻回覆目前的狀態（滑鼠事件串流連著的頁面不留著長輪詢，連上時和收到 wake 時才來問）
                     if (!SameOrigin(r)) return Error(403, "forbidden");
                     string mon = Q(r, "mon") ?? "";
                     if (!IsId(mon)) return Error(400, "bad id");
@@ -2427,7 +3555,11 @@ namespace AsciiWallpaper
                     bool? s = sq == "1" ? true : sq == "0" ? (bool?)false : null;
                     string lq = Q(r, "l"); // 頁面目前知道的介面語言；舊版頁面沒有（不認得的值也當作沒送，免得空轉）
                     string l = lq == "zh" || lq == "en" ? lq : null;
-                    return Json(Hub.Wait(mon, Q(r, "v") ?? "", Q(r, "p") == "1", s, l, 25000));
+                    // 這一頁現在播的動畫要不要右鍵拖曳（例如轉動 3D 視角）：每次輪詢都記下；舊版頁面沒有 rd = 不要。
+                    // 暫停中（系統匣暫停、被蓋住、鎖定）不要：桌布不會動，右鍵照常交給桌面。看播放器自己現在的暫停狀態（不是頁面知道的 p）：
+                    // 暫停一變，等待中的長輪詢馬上回覆、連著串流的頁面收到 wake，都會馬上再來問，這裡就記下新的（不必等頁面再用新的 p 問一次）
+                    InputForward.SetRightDrag(mon, Q(r, "rd") == "1" && !Hub.Paused(mon));
+                    return Json(Hub.Wait(mon, Q(r, "v") ?? "", Q(r, "p") == "1", s, l, Q(r, "nowait") == "1" ? 0 : 25000));
                 }
                 if (r.Path == "/api/version")
                 {
@@ -2460,6 +3592,7 @@ namespace AsciiWallpaper
                         var ids = app.Ui(() => app.ResolveTargets(mon));
                         if (ids.Count == 0) return Error(400, I18n.T("找不到這個螢幕", "Monitor not found"));
                         foreach (var id in ids) Files.WriteAtomic(Files.WallPath(id), r.Body); // 大檔案在這裡寫，不卡住 UI
+                        foreach (var id in ids) InputForward.SetRightDrag(id, false); // 新的頁面第一次輪詢時會再告訴我們要不要右鍵拖曳
                         Hub.Poke();
                         err = app.Ui(() => app.Applied(ids, title, titleEn));
                         break;
@@ -2504,9 +3637,11 @@ namespace AsciiWallpaper
                 case "/api/debug/input":
                     {
                         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ASCIIWP_DEBUG_PORT"))) return Error(404, "not found");
-                        int x, y;
+                        int x, y, d;
                         if (!int.TryParse(Q(r, "x"), out x) || !int.TryParse(Q(r, "y"), out y)) return Error(400, "x, y");
-                        err = InputForward.Inject(Q(r, "type") ?? "move", x, y) ? null : "no wallpaper at that point";
+                        if (!int.TryParse(Q(r, "d"), out d)) d = 120;   // 滾輪：WM_MOUSEWHEEL 的值（120 = 往前推一格 = 往上捲）
+                        // type = move / down / up / rdown / rup / wheel / leave；頁面連著滑鼠事件串流時從串流送
+                        err = InputForward.Inject(Q(r, "type") ?? "move", x, y, d) ? null : "no wallpaper at that point";
                         break;
                     }
                 case "/api/saved/put":

@@ -22,6 +22,12 @@
   const SND_MIN = 0.05;     // 接近速度不到示範時單顆球的 5%：不出聲
   const SND_MIN_HELD = 0.2; // 其中一顆被拿著（滑鼠或示範的手）：要 20% 以上才出聲（拿著球推一整排時，滑鼠一頓一頓的，球會一直輕輕彈開又靠回來）
   const SND_D = 1.3, SND_K = 0.16;   // 聽起來的位置：鏡頭看著的那一點在聽者正前方 1.3 公尺，1 單位（球的半徑）= 0.16 公尺
+  // 滑鼠：按下時游標離球心不到 PICK_R 倍球的視半徑就抓得到（正好點在球上的優先）；按住右鍵拖曳轉動視角
+  const PICK_R = 1.6;
+  const PIT_MIN = 0.02, PIT_MAX = 1.05;   // 右鍵拖曳時鏡頭的仰角範圍（弧度）：最低幾乎平視（不會跑到底座下面），最高約 60°（不會翻過頭頂）
+  const UV_HOLD = 20;                     // 最後一次操作後，轉過的視角再留 20 秒，然後慢慢回到示範的鏡頭路線
+  const RING_GAP = 0.16, RING_MIN = 1.2, RING_MAX = 2.4;   // 「會抓到這顆」的圓圈在球的輪廓外面幾格（球的視半徑的 16%，限制在 1.2–2.4 格）
+  const RIM_CH = '()_/|' + BSL + MAC + HLN;                  // 球的輪廓用到的字元（著色的球面只用 RAMP 裡的字元）
 
   // 線條字元：phi 是線段在畫面上的方向角（度，0 = 水平，往右上為正），off 是線在格子裡偏離中心的位置（-0.5..0.5，往下／往右為正）
   // vert = 這條線是一列一格（off 是左右位置）；否則是一欄一格（off 是上下位置）；curved = 球的輪廓
@@ -322,12 +328,62 @@
   }
   // 這個角度下剛好放得進畫面（留邊）的焦距
   function fitF(s, f) { return Math.min(s.fitW * s.availW / (s.bu1 - s.bu0), s.fitH * s.availH * f.aspect / (s.bv1 - s.bv0)); }
-  function setCamera(s, f) {
+  // ── 使用者轉過的視角（按住右鍵拖曳）──
+  // s.uv = 使用者的視角在用；s.uw = 它的份量（1 = 完全是使用者的視角，回到示範時慢慢降到 0）；s.uE = 回去示範走了多久（0 = 還留著）；
+  // s.uS = 回去的速度（半路上有人回來時很快降到 0）。uYaw/uPit/uDist = 使用者的鏡位（uYawT/uPitT = 拖曳的目標），udy = uYaw - 示範的方位角
+  // 從「現在畫面上的樣子」開始（鏡位、焦距、置中都接著用），所以剛按下右鍵、或回去的半路上又有人操作時，畫面都不會跳
+  function camGrab(s) {
+    s.uv = 1; s.uE = 0; s.uw = 1; s.uS = 1; s.ubu = s.cbu; s.ubv = s.cbv;
+    s.uYaw = s.uYawT = s.vyaw; s.uPit = s.vpit; s.uPitT = clamp(s.vpit, PIT_MIN, PIT_MAX); s.uDist = s.vdist;
+    const d = s.vyaw - s.dyaw; s.udy = d - TAU * Math.round(d / TAU);
+    s.uF = s.uF0 = s.Fd;
+  }
+  // 每格：跟著拖曳的目標慢慢轉過去（阻尼）；最後一次操作 UV_HOLD 秒後，花幾秒（轉得越多越久）平順地混回示範的鏡頭路線。
+  // 「最後一次操作」用 s.uIdle：按著滑鼠（抓著球、按著右鍵）不動也算還在操作
+  function userCam(s, dt) {
+    if (s.uE > 0 || s.uIdle >= UV_HOLD) {
+      // 開始回去：走最近的那一邊（轉了好幾圈也不會倒著轉回去），轉得越多花越久
+      if (s.uE === 0) { s.udy -= TAU * Math.round(s.udy / TAU); s.uDur = clamp(2.5 + 2.2 * Math.hypot(s.udy, s.uPit - s.dpit), 2.5, 10); s.uZ = s.zoomU; s.uS = 1; }
+      // 回去的半路上又有人來了：和示範的鏡頭一樣很快地停下來（約 0.2 秒），停住的樣子就是新的視角
+      if (s.uIdle < UV_HOLD) s.uS *= Math.exp(-dt * 6);
+      if (s.uS < 0.01) camGrab(s);
+      else {
+        s.uE += dt * s.uS;
+        const e = Math.min(1, s.uE / s.uDur);
+        s.uw = 1 - e * e * e * (e * (e * 6 - 15) + 10);
+        s.zoomU = 1 + (s.uZ - 1) * s.uw;   // 滾輪縮放也跟著一起回去
+        if (e >= 1) { s.uv = 0; s.uw = 0; s.zoomU = 1; s.pyaw = s.dyaw; s.ppit = s.dpit; s.pdist = s.ddist; return; }   // 回到示範的鏡頭路線了
+      }
+    }
+    const k = 1 - Math.exp(-dt * 12);
+    s.uYaw += (s.uYawT - s.uYaw) * k; s.uPit += (s.uPitT - s.uPit) * k;
+    // 使用者和示範鏡頭的方位角差 udy = uYaw - 示範的方位角：連續追蹤（示範的環繞鏡頭繞完一圈、方位角少掉 360° 時也不會跳）
+    const d = s.uYaw - s.dyaw - s.udy; s.udy += d - TAU * Math.round(d / TAU);
+    const w = s.uw;
+    s.pyaw = s.uYaw - s.udy * (1 - w); s.ppit = s.dpit + (s.uPit - s.dpit) * w; s.pdist = s.ddist + (s.uDist - s.ddist) * w;
+  }
+  function setCamera(s, f, dt) {
     const A = f.aspect;
     camBasis(s); camBox(s);
     // 焦距：init 裡算好的平滑表（見 buildFrameTable）
-    const F0 = frameF(s, s.tau);
-    const cx0 = f.cols / 2 - F0 * (s.bu0 + s.bu1) / 2, cy0 = s.availCy + F0 * (s.bv0 + s.bv1) / (2 * A);
+    let F0 = frameF(s, s.tau), cx0, cy0;
+    if (s.uv) {
+      // 使用者轉過的視角：焦距接著用轉之前的；轉到整座擺放不下的角度才慢慢拉遠（回到示範時跟著混回平滑表）
+      s.uF += (Math.min(s.uF0, 0.985 * fitF(s, f)) - s.uF) * (1 - Math.exp(-dt * 3));
+      F0 += (s.uF - F0) * s.uw;
+      // 置中：外框的中心在換成另一個角落時會突然轉向（例如從側面轉到正對兩端），轉動視角時用稍微慢一點跟上的中心，
+      // 畫面才不會頓一下；快回到示範時再慢慢換回外框的中心
+      let bu = (s.bu0 + s.bu1) / 2, bv = (s.bv0 + s.bv1) / 2;
+      const k = 1 - Math.exp(-dt * 5), q = Math.min(1, s.uw * 3);
+      s.ubu += (bu - s.ubu) * k; s.ubv += (bv - s.ubv) * k;
+      bu += (s.ubu - bu) * q; bv += (s.ubv - bv) * q;
+      s.cbu = bu; s.cbv = bv;
+      cx0 = f.cols / 2 - F0 * bu; cy0 = s.availCy + F0 * bv / A;
+    } else {
+      cx0 = f.cols / 2 - F0 * (s.bu0 + s.bu1) / 2; cy0 = s.availCy + F0 * (s.bv0 + s.bv1) / (2 * A);
+      s.cbu = (s.bu0 + s.bu1) / 2; s.cbv = (s.bv0 + s.bv1) / 2;
+    }
+    s.Fd = F0; s.vyaw = s.pyaw; s.vpit = s.ppit; s.vdist = s.pdist;   // 畫面上的樣子（camGrab 從這裡開始）
     // 滾輪放大時以球列為中心
     const Z = s.zoomU;
     const qx = -s.ex, qy = s.c0 + 0.9 - s.ey, qz = -s.ez, zc = qx * s.fx + qy * s.fy + qz * s.fz;
@@ -637,6 +693,47 @@
       }
     }
   }
+  // 有人在玩、手上沒有球時：「按下去會抓到的那顆球」（見 pick）的輪廓改成最亮的顏色，外面再畫一圈亮的圓圈
+  // （和輪廓同樣的畫法，半徑比球的輪廓大一兩格；圓圈在球心的深度，被前面的東西擋住、或落在其他球上的地方不畫）
+  function hoverRing(s, f, i) {
+    const A = f.aspect, cols = f.cols, zb = s.zb, ch = f.g.ch, co = f.g.co, uu = s.uu, rbv = s.rbv;
+    const Cx = s.bcx[i], Cy = s.bcy[i];
+    const qx = Cx - s.ex, qy = Cy - s.ey, qz = -s.ez;
+    const cx = qx * s.rx + qy * s.ry + qz * s.rz, cy = qx * s.ux + qy * s.uy + qz * s.uz, cz = qx * s.fx + qy * s.fy + qz * s.fz;
+    const Cl = Math.hypot(cx, cy, cz);
+    if (Cl <= 1.05 || cz <= 0.5) return;
+    const ta = 1 / Math.sqrt(Cl * Cl - 1), gap = clamp(ta * s.F * RING_GAP, RING_MIN, RING_MAX), ah = Math.atan(ta + gap / s.F);
+    const cosA = Math.cos(ah), Rh = Cl * Math.sin(ah) + 0.05;
+    if (!rect(s, f, Cx - Rh, Cy - Rh, -Rh, Cx + Rh, Cy + Rh, Rh, 2)) return;
+    const x0 = s.x0, x1 = s.x1, y0 = s.y0, y1 = s.y1, w = x1 - x0 + 1, fb = s.fb, ob = s.ob, col = s.cHi;
+    for (let y = y0; y <= y1; y++) {
+      const v = rbv[y];
+      for (let x = x0; x <= x1; x++) {
+        const u = uu[x], k = y * cols + x;
+        fb[(y - y0) * w + (x - x0)] = (u * cx + v * cy + cz) / (Math.sqrt(1 + u * u + v * v) * Cl) - cosA;
+        if (ob[k] === i && RIM_CH.includes(ch[k])) co[k] = col;   // 這顆球自己的輪廓也改成最亮的顏色
+      }
+    }
+    for (let y = y0 + 1; y < y1; y++) {
+      for (let x = x0 + 1; x < x1; x++) {
+        const kb = (y - y0) * w + (x - x0), fv = fb[kb];
+        const gx = (fb[kb + 1] - fb[kb - 1]) * 0.5, gyv = (fb[kb + w] - fb[kb - w]) * 0.5 / A;
+        const gl = Math.sqrt(gx * gx + gyv * gyv);
+        if (gl < 1e-12) continue;
+        const sd = -fv / gl;
+        if (sd > 2.2 || sd < -2.2 * A) continue;
+        const nx = -gx / gl, ny = -gyv / gl;
+        let off;
+        const hz = Math.abs(ny) >= Math.abs(nx) / A;
+        if (hz) { off = (-sd / ny) / A; } else { off = -sd / nx; }
+        if (!(off >= -0.5 && off < 0.5)) continue;
+        const k = y * cols + x;
+        if (zb[k] < cz || ob[k] >= 0) continue;
+        let phi = Math.atan2(-nx, -ny) * 57.29578; if (phi < 0) phi += 180; if (phi >= 180) phi -= 180;
+        ch[k] = lineCh(phi, off, !hz, true, nx < 0 ? -1 : 1); co[k] = col;
+      }
+    }
+  }
 
   function buildColors(s, f) {
     s.lastC = f.C; s.lastH = f.H;
@@ -662,6 +759,7 @@
     s.cEdgeHi = brass ? f.H(34, 0.62) : f.C(0.56);
     s.cCap = f.C(0.42);
     s.cArc = f.C(0.3); s.cArcHi = f.C(0.5);
+    s.cHi = f.C(1);
   }
 
   function render(s, f) {
@@ -706,11 +804,16 @@
         line3(s, f, s.px[i], s.Hp, ez >= 0 ? s.zr : -s.zr, tx, ty, 0, cN, -9, 0, -1, true);
       }
     }
-    if (s.playing && (s.hover >= 0 || s.drag)) swingArc(s, f, s.drag ? s.drag.i : s.hover, !!s.drag);
+    if (s.playing && s.drag) swingArc(s, f, s.drag.i, true);
     const ord = s.ord;
     for (let i = 0; i < n; i++) { ord[i] = i; const qx = s.bcx[i] - s.ex, qy = s.bcy[i] - s.ey, qz = -s.ez; s.bcz[i] = qx * s.fx + qy * s.fy + qz * s.fz; }
     for (let a = 1; a < n; a++) { const v = ord[a]; let b = a - 1; while (b >= 0 && s.bcz[ord[b]] < s.bcz[v]) { ord[b + 1] = ord[b]; b--; } ord[b + 1] = v; }
     if (s.contour) for (let q = 0; q < n; q++) sphereContour(s, f, ord[q]);
+    // 手上沒有球時：「現在按下去會抓到的那顆球」（pick）用這一格畫好的畫面來找，和下一格按下時抓到的一定是同一顆；
+    // 畫出它可以擺動的弧線（只畫在空白的格子），有人在玩時再加上亮的輪廓和外圈
+    const m = f.mouse;
+    s.hover = s.playing && !s.drag && m && m.on && !m.down ? pick(s, f, m.x, m.y) : -1;
+    if (s.hover >= 0) { swingArc(s, f, s.hover, false); if (s.idle < 6) hoverRing(s, f, s.hover); }
   }
 
   // 逐格著色：球（鏡面金屬）、底座、夠粗的金屬桿
@@ -868,7 +971,8 @@
 
   // ── 滑鼠 ──
   // 點選：先看游標那一格畫的是哪顆球（和畫面完全一致，連輪廓那一格也算），
-  // 沒有的話用同一條光線做精確的球面測試（例如球被細桿擋住），最後是差不到一格的寬容範圍
+  // 沒有的話用同一條光線做精確的球面測試（例如球被細桿擋住）；都沒打中就是寬容範圍：
+  // 從相機看，游標和球心的夾角不到 PICK_R 倍球的視半徑（角半徑）的球裡，取倍數最小的那一顆（遠近不同的球一樣寬容），再遠就不抓
   function pick(s, f, mx, my) {
     const A = f.aspect, u = (mx - s.ccx) / s.F, v = (s.ccy - my) * A / s.F;
     const dx = s.fx + u * s.rx + v * s.ux, dy = s.fy + u * s.ry + v * s.uy, dz = s.fz + u * s.rz + v * s.uz;
@@ -876,28 +980,25 @@
     const cx = Math.floor(mx), cy = Math.floor(my);
     let hit = -1;
     if (cx >= 0 && cy >= 0 && cx < f.cols && cy < f.rows) { const o = s.ob[cy * f.cols + cx]; if (o >= 0 && o < s.n) hit = o; }
-    let best = 1e9, bi = -1, near = -1, nd = 1;
+    let best = 1e9, bi = -1, near = -1, nq = PICK_R;
     for (let i = 0; i < s.n; i++) {
       const ox = s.ex - s.bcx[i], oy = s.ey - s.bcy[i], oz = s.ez;
       const b = dx * ox + dy * oy + dz * oz, c = ox * ox + oy * oy + oz * oz - 1, h = b * b - a * c;
       if (h >= 0) { const t = (-b - Math.sqrt(h)) / a; if (t > 0 && t < best) { best = t; bi = i; } }
-      else {
-        // 光線離球面多遠（換成格子）
-        const tm = -b / a, gap = Math.sqrt(Math.max(0, c + 1 - b * b / a)) - 1;
-        const cells = gap * s.F / Math.max(0.5, tm * Math.sqrt(a));
-        if (tm > 0 && cells < nd) { nd = cells; near = i; }
+      else if (b < 0 && c > 0.01) {
+        // 光線和「相機 → 球心」的夾角是球的角半徑的幾倍
+        const D = Math.sqrt(c + 1), q = Math.acos(Math.min(1, -b / (Math.sqrt(a) * D))) / Math.asin(1 / D);
+        if (q < nq) { nq = q; near = i; }
       }
     }
     if (hit < 0) hit = bi >= 0 ? bi : near;
     if (hit < 0) return -1;
-    // 抓住的那一點：光線打到球面的點；擦過的話取球面上離光線最近的點
+    // 抓住的那一點：光線打到球面的點；沒打到球面（擦過或在球旁邊）就取光線上離球心最近的點：
+    // 這一點就在游標底下，跟著球一起轉，拖動時它跟著游標走，球不會一抓就跳過去
     const ox = s.ex - s.bcx[hit], oy = s.ey - s.bcy[hit], oz = s.ez;
     const b = dx * ox + dy * oy + dz * oz, c = ox * ox + oy * oy + oz * oz - 1, h = b * b - a * c;
-    if (h >= 0) { const t = (-b - Math.sqrt(h)) / a; s.gpx = s.ex + t * dx; s.gpy = s.ey + t * dy; s.gpz = s.ez + t * dz; }
-    else {
-      const t = -b / a, qx = s.ex + t * dx - s.bcx[hit], qy = s.ey + t * dy - s.bcy[hit], qz = s.ez + t * dz, ql = Math.hypot(qx, qy, qz) || 1;
-      s.gpx = s.bcx[hit] + qx / ql; s.gpy = s.bcy[hit] + qy / ql; s.gpz = qz / ql;
-    }
+    const t = h >= 0 ? (-b - Math.sqrt(h)) / a : -b / a;
+    s.gpx = s.ex + t * dx; s.gpy = s.ey + t * dy; s.gpz = s.ez + t * dz;
     return hit;
   }
   // 找出讓「抓住的那一點」投影最接近滑鼠的角度
@@ -946,9 +1047,12 @@
   }
   function input(s, f) {
     const m = f.mouse;
-    if (!m) { s.playing = false; return; }
+    if (!m) { s.playing = false; s.idle = Infinity; s.uIdle = Infinity; return; }
     const idle = typeof m.idle === 'number' && m.idle === m.idle ? m.idle : Infinity;
-    const playing = idle < 6 || (!!m.down && idle < 60);
+    s.idle = idle;
+    // 轉過的視角要留多久（見 userCam）：按著滑鼠不動時 idle 不會更新，按著就當作一直在操作（和下面的 playing 一樣最多 60 秒）
+    s.uIdle = (m.down || m.rdown) && idle < 60 ? 0 : idle;
+    const playing = idle < 6 || ((!!m.down || !!m.rdown) && idle < 60);
     if (playing && !s.playing) {
       // 玩家接手：看不見的手放開
       if (s.ph === 'lift' || s.ph === 'hold' || s.ph === 'calm') releaseAll(s);
@@ -957,8 +1061,24 @@
     // 玩家離開：讓球繼續擺一下再接手示範；說明文字先不寫顆數（還在擺的是玩家放的球，不是上一個示範花樣）
     if (!playing && s.playing) { if (s.drag) endDrag(s); s.ph = 'swing'; s.pt = 0; s.swingT = 5; s.hover = -1; s.curPat = null; }
     s.playing = playing;
-    const down = !!m.down, clicks = m.clicks || [];
-    if (!playing) { s.wasDown = down; return; }
+    const down = !!m.down, clicks = m.clicks || [], rd = !!m.rdown;
+    if (!playing) { s.wasDown = down; s.wasR = rd; return; }
+    // 按住右鍵拖曳：轉動視角（左右 = 繞著牛頓擺轉，上下 = 抬高、降低鏡頭）。拖過一個螢幕高度大約轉半圈；
+    // 開始拖動時從畫面上現在的視角開始（示範的鏡頭停在那裡，正在回去的話就停在半路）。按下右鍵沒有拖動（單純點一下右鍵，
+    // 桌面上會叫出桌面選單）不算轉動視角
+    if (rd) {
+      if (!s.wasR) s.rPend = 1;
+      else if (m.x !== s.rlx || m.y !== s.rly) {
+        s.rPend = 0;
+        if (!s.uv || s.uE > 0) camGrab(s);
+        const S = Math.max(8, Math.min(f.cols, f.rows * f.aspect));
+        s.uYawT -= Math.PI * (m.x - s.rlx) / S;
+        s.uPitT = clamp(s.uPitT + Math.PI * (m.y - s.rly) * f.aspect / S, PIT_MIN, PIT_MAX);
+      }
+      s.rlx = m.x; s.rly = m.y;
+    }
+    s.wasR = rd;
+    if (s.uv && s.uE > 0 && (down || m.wheel)) camGrab(s);
     if (m.wheel && !s.drag && !down) s.zoomU = clamp(s.zoomU * Math.exp(-m.wheel * 0.0012), 0.75, 1.5);
     // 按下：用點擊事件的位置（按下的那一刻）；只有「按住」沒有點擊事件時，就用目前位置
     if (down && !s.drag) {
@@ -983,18 +1103,19 @@
         nudge(s, hit, (s.gpx - s.bcx[hit]) * Math.cos(s.th[hit]) + (s.gpy - s.bcy[hit]) * Math.sin(s.th[hit]));
       }
     }
-    s.hover = !s.drag && m.on && !down ? pick(s, f, m.x, m.y) : -1;
     s.wasDown = down;
   }
 
   const SEED = ['tau', 'cspd', 'zoomU', 'time', 'pt', 'liftT', 'swingT', 'acc', 'Eref', 'gpx', 'gpy', 'gpz', 'rrE', 'F', 'ccx', 'ccy', 'ex', 'ey', 'ez',
     'fx', 'fy', 'fz', 'rx', 'ry', 'rz', 'ux', 'uy', 'uz', 'pyaw', 'ppit', 'pdist', 'bu0', 'bu1', 'bv0', 'bv1', 'w2', 'damp', 'rest', 'vrest', 'ctol',
     'ecap', 'L', 'Hp', 'c0', 'rr', 'yR', 'zr', 'X', 'bxw', 'bzw', 'bh', 'tgtY', 'baseK', 'sp', 'r', 'fsp', 'thMax', 'availW', 'availH', 'availCy', 'fitW', 'fitH', 'sx', 'sy',
-    'evSV', 'evSX', 'evSY', 'evSW'];
+    'evSV', 'evSX', 'evSY', 'evSW', 'idle', 'uIdle', 'uE', 'uw', 'uDur', 'uZ', 'uS', 'ubu', 'ubv', 'cbu', 'cbv', 'uYaw', 'uYawT', 'uPit', 'uPitT', 'uDist', 'udy', 'uF', 'uF0', 'Fd', 'dyaw', 'dpit', 'ddist',
+    'vyaw', 'vpit', 'vdist', 'rlx', 'rly'];
 
   A({
     id: 'cradle3d', name: '3D 牛頓擺', cat: '遊戲', theme: 'mono', hue: false, interactive: true, sound: true,
-    desc: '會慢慢轉換視角的立體金屬牛頓擺；按住一顆球往外拉再放手，滾輪縮放',
+    rightDrag: true,   // 按住右鍵拖曳轉動視角（f.mouse.rdown；全部變化款都是）
+    desc: '會慢慢轉換視角的立體金屬牛頓擺；按住一顆球往外拉再放手，按住右鍵拖曳轉動視角，滾輪縮放',
     // 擺動週期 1.1 秒：示範時大約每 0.55 秒「鏘」一聲，接近音效參考的大型牛頓擺錄音（每 0.537 秒一聲）；黃銅款刻意慢一點
     params: { n: 5, len: 5.4, period: 1.1, cam: 'hero', mat: 'chrome', contour: true, floor: true },
     variants: [
@@ -1033,6 +1154,9 @@
       s.playing = false; s.wasDown = false; s.drag = null; s.hover = -1; s.time = 0; s.gpx = 0; s.gpy = 0; s.gpz = 0;
       // 相機與光
       s.camMode = p.cam; s.tau = 0; s.cspd = 1; s.zoomU = 1;
+      // 使用者轉過的視角（見 camGrab、userCam）：一開始沒有；d* = 示範鏡頭的鏡位，v* = 畫面上的鏡位
+      s.uv = 0; s.uE = 0; s.uw = 0; s.uDur = 0; s.uZ = 1; s.uS = 1; s.ubu = 0; s.ubv = 0; s.cbu = 0; s.cbv = 0; s.uYaw = 0; s.uYawT = 0; s.uPit = 0; s.uPitT = 0; s.uDist = 0; s.udy = 0; s.uF = 0; s.uF0 = 0; s.Fd = 0;
+      s.dyaw = 0; s.dpit = 0; s.ddist = 0; s.vyaw = 0; s.vpit = 0; s.vdist = 0; s.wasR = false; s.rPend = 0; s.rlx = 0; s.rly = 0; s.idle = Infinity; s.uIdle = Infinity;
       if (s.camMode === 'orbit') buildOrbit(s);
       const L = Math.hypot(-0.45, 0.8, 0.5); s.lkx = -0.45 / L; s.lky = 0.8 / L; s.lkz = 0.5 / L;
       const L2 = Math.hypot(0.75, 0.3, -0.6); s.lrx = 0.75 / L2; s.lry = 0.3 / L2; s.lrz = -0.6 / L2;
@@ -1058,7 +1182,7 @@
       // 一開始就是「剛放開」的樣子，不用等
       startLift(s); for (let i = 0; i < n; i++) s.th[i] = s.tg[i];
       releaseAll(s); s.ph = 'swing'; s.pt = 0; s.swingT = 13;
-      poseAt(s, 0); setCamera(s, f);
+      poseAt(s, 0); s.dyaw = s.pyaw; s.dpit = s.ppit; s.ddist = s.pdist; setCamera(s, f, 0);
       for (let i = 0; i < n; i++) { s.bcx[i] = s.px[i] + s.L * Math.sin(s.th[i]); s.bcy[i] = s.Hp - s.L * Math.cos(s.th[i]); }
       // 會存小數的欄位先存一次小數、拖曳欄位先放一次物件：V8 一開始就用最後的欄位型別，
       // 第一次有人按滑鼠或第一次抬球時才不會整段程式重新最佳化（會卡一下）
@@ -1072,13 +1196,15 @@
       simulate(s, dt);
       // 相機：有人在玩就停住（按著滑鼠時完全不動），沒人玩再慢慢動起來
       const tgt = s.playing ? 0 : 1;
-      if (s.drag || (f.mouse && f.mouse.down && s.playing)) s.cspd = 0;
+      if (s.drag || (f.mouse && (f.mouse.down || f.mouse.rdown) && s.playing)) s.cspd = 0;
       else s.cspd += (tgt - s.cspd) * (1 - Math.exp(-dt * (tgt < s.cspd ? 6 : 0.4)));
       if (s.cspd < 1e-3 && tgt === 0) s.cspd = 0;
-      if (!s.playing) s.zoomU += (1 - s.zoomU) * (1 - Math.exp(-dt * 0.5));
+      // 滾輪縮放：沒人玩就慢慢回到原來的大小（轉過的視角還在的時候由 userCam 處理：先留著，視角回去時一起回去）
+      if (!s.playing && !s.uv) s.zoomU += (1 - s.zoomU) * (1 - Math.exp(-dt * 0.5));
       s.tau += dt * s.cspd;
-      if (s.cspd > 0) poseAt(s, s.tau);
-      setCamera(s, f);
+      if (s.cspd > 0) { poseAt(s, s.tau); s.dyaw = s.pyaw; s.dpit = s.ppit; s.ddist = s.pdist; }
+      if (s.uv) userCam(s, dt);
+      setCamera(s, f, dt);
       if (s.evOpen && s.evAge > SND_FUSE) sndClose(s);
       if (s.evN) sndEmit(s, f);
       render(s, f);
@@ -1093,6 +1219,11 @@
         // 英文比較長：放不下時先拿掉「Momentum conserved ·」，顆數和操作說明（寬度 70 以上一定有，和中文一樣）留著
         if (f.lang === 'en' && what && !fits(wide ? msg + hint : msg)) msg = what;
         txtC(g, f.rows - 1, msg + (wide && fits(msg + hint) ? hint : ''), s.cCap);
+      } else if (!s.drag && s.idle < 6 && f.cols >= 70) {
+        // 有人在玩、手上沒有球：同一列改成操作說明（放不下時先拿掉右鍵那一句；寬度不到 70 不顯示）
+        const g = f.g, fits = t => g.textW(t) + 4 <= f.cols;
+        const a = tr(f, '按住鋼球左右拉、放開就會擺動', 'Pull a ball sideways and let go'), b = tr(f, '・按住右鍵拖曳可轉動視角', ' · Right-drag to rotate the view');
+        if (fits(a + b)) txtC(g, f.rows - 1, a + b, s.cCap); else if (fits(a)) txtC(g, f.rows - 1, a, s.cCap);
       }
     },
   });

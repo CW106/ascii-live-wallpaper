@@ -831,20 +831,20 @@ const SFX_SYN = (() => {
   }
   // 每種聲音：(取樣率, 亂數) → 單聲道波形（峰值 1）。每次呼叫結果都略有不同
   return {
-    // 牛頓擺（大型）：大鋼珠相撞的「鏘」（照使用者給的巨型牛頓擺影片量過再調的）。比桌上型暗很多的中高頻金屬聲：
-    // 能量集中在 2–3 kHz（1.5–6 kHz 都有），6 kHz 以上很少，400 Hz 以下幾乎沒有。一下乾淨的撞擊（不像小鋼珠那樣一串碰撞），
-    // 接著是 30 個靠得很近、不成整數倍的金屬共振（1.9–3.3 kHz，沒有單一音高）長長地響：振幅約 0.11 秒降到 1/e，
-    // 0.3 秒時約低 30 dB，下一下撞擊來時還在響；整聲 0.65 秒，最後 0.15 秒慢慢淡出。另外有幾個較弱的高分音（3.5–4.8 kHz）、
-    // 兩個很弱的低分音（0.76、0.92 kHz）和兩層很快消失的寬頻「沙沙」（約 4 kHz、1.5 kHz），聲音比較厚。
+    // 牛頓擺：鋼珠相撞的「鏘」。從照巨型牛頓擺影片量出來的聲音出發，再依使用者挑的「稍微輕脆」版本整體調亮、調短：
+    // 共振頻率 ×1.3（30 個靠得很近、不成整數倍的金屬共振在 2.5–4.3 kHz，沒有單一音高）、餘音 ×0.6（振幅約 0.066 秒降到 1/e，
+    // 約 0.18 秒低 30 dB）、撞擊的「喀」再明顯一點（比共振高 23 dB）、低分音幾乎拿掉（-20 dB）；音色重心約 3.7 kHz，整聲 0.42 秒。
+    // 另外有幾個較弱的高分音和兩層很快消失的寬頻「沙沙」（約 5.5 kHz、2 kHz）。
     // 每個版本：共振頻率整體偏 ±1 %、各自再偏 ±0.2 %，各分音大小 ±1.5 dB，整體音量 ±15 %
     clack(sr, r) {
-      const n = Math.round(sr * 0.65), R = (a, b) => a + (b - a) * r(), lv = R(0.85, 1.15), det = 1 + R(-0.01, 0.01), x = new Float32Array(n);
+      const FM = 1.3, TM = 0.6;   // 頻率倍率、餘音長度倍率（相對於照巨型牛頓擺量出來的原始聲音）
+      const n = Math.round(sr * 0.42), R = (a, b) => a + (b - a) * r(), lv = R(0.85, 1.15), det = 1 + R(-0.01, 0.01), x = new Float32Array(n);
       const rms = (y, a, b) => { let q = 0; for (let i = a; i < b; i++) q += y[i] * y[i]; return Math.sqrt(q / (b - a)); };
       // 1) 金屬共振 [頻率, dB, 衰減時間常數 秒]：用遞迴算衰減的正弦（不用每個樣本都算 sin），起始相位大致對齊（像真的被撞了一下）
-      const tc = f => 0.11 * Math.pow(f / 2600, 0.25), M = [];
-      for (const f of [1942, 2159, 2232, 2306, 2317, 2379, 2394, 2405, 2417, 2438, 2461, 2505, 2546, 2581, 2619, 2631, 2672, 2716, 2742, 2754, 2813, 2836, 2854, 2965, 3021, 3044, 3059, 3105, 3264, 3293]) M.push([f, 0, tc(f)]);
-      for (const f of [3480, 3730, 4020, 4390, 4810]) M.push([f, -6.5, 1.125 * tc(f)]);
-      for (const f of [760, 920]) M.push([f, -13.5, 0.3]);
+      const tc = f => TM * 0.11 * Math.pow(f / (2600 * FM), 0.25), M = [];
+      for (const f of [1942, 2159, 2232, 2306, 2317, 2379, 2394, 2405, 2417, 2438, 2461, 2505, 2546, 2581, 2619, 2631, 2672, 2716, 2742, 2754, 2813, 2836, 2854, 2965, 3021, 3044, 3059, 3105, 3264, 3293]) M.push([f * FM, 0, tc(f * FM)]);
+      for (const f of [3480, 3730, 4020, 4390, 4810]) M.push([f * FM, -6.5, 1.125 * tc(f * FM)]);
+      for (const f of [760, 920]) M.push([f * FM, -20, 0.3 * TM]);
       for (const [f0, ldb, tau] of M) {
         const f = f0 * det * (1 + R(-0.002, 0.002)), a = Math.pow(10, (ldb + R(-1.5, 1.5)) / 20), w = (TAU * f) / sr, p = Math.exp(-1 / (tau * sr)), c = 2 * p * Math.cos(w), d = p * p, ph = 0.7 * r() * TAU;
         const end = Math.min(n, Math.ceil(tau * sr * Math.log(a / 1e-5)));
@@ -855,7 +855,7 @@ const SFX_SYN = (() => {
       const i8 = Math.round(0.008 * sr), i30 = Math.round(0.03 * sr), rr = rms(x, i8, i30);   // 共振在 8–30 ms 的大小：其他部分都照它調
       // 2) 兩層很快消失的寬頻沙沙（共振之間和周圍很多很弱的分音）[時間常數, 帶通中心, Q, 低通, 低通兩次, dB]
       const z = new Float32Array(n);
-      for (const [tau, f, q, lp, two, db] of [[0.04, 4200, 2.3, 3900, true, 3], [0.0375, 1550, 4, 5950, false, -2.5]]) {
+      for (const [tau, f, q, lp, two, db] of [[0.04 * TM, 4200 * FM, 2.3, Math.min(15000, 3900 * FM), true, 3], [0.0375 * TM, 1550 * FM, 4, Math.min(15000, 5950 * FM), false, -2.5]]) {
         for (let i = 0, k = Math.exp(-1 / (tau * sr)), e = 1; i < n; i++, e *= k) z[i] = e > 1e-5 ? (r() * 2 - 1) * e : 0;
         filt(z, sr, 'bp', f, q); filt(z, sr, 'lp', lp, 0.7); if (two) filt(z, sr, 'lp', lp, 0.7);
         const k = (rr * Math.pow(10, db / 20)) / (rms(z, i8, i30) || 1);
@@ -864,16 +864,16 @@ const SFX_SYN = (() => {
       // 3) 共振和沙沙在前 2 ms 圓滑地長出來
       const na = Math.round(0.002 * sr);
       for (let i = 0; i < na; i++) x[i] *= 0.5 - 0.5 * Math.cos((Math.PI * i) / na);
-      // 4) 撞擊本身：一個脈衝濾成 0.85–8.4 kHz（約 0.3 ms 的「喀」，峰值比共振高 21.5 dB），加上約 7 ms、5 kHz 附近的接觸沙沙
+      // 4) 撞擊本身：一個脈衝濾成約 1.1–11 kHz（約 0.3 ms 的「喀」，峰值比共振高 23 dB），加上約 4 ms、6–8 kHz 附近的接觸沙沙
       const ns = Math.round(sr * 0.04), s = new Float32Array(ns), s2 = new Float32Array(ns);
       s[2] = 1;
-      filt(s, sr, 'hp', 850, 0.7); filt(s, sr, 'lp', 8400, 0.7); filt(s, sr, 'lp', 8400, 0.7);
-      for (let i = 0, k = Math.exp(-1 / (0.007 * sr)), e = 1; i < ns; i++, e *= k) s2[i] = (r() * 2 - 1) * e;
-      filt(s2, sr, 'hp', 6000, 0.7); filt(s2, sr, 'lp', 4750, 0.7); filt(s2, sr, 'lp', 4750, 0.7);
-      const k1 = (rr * Math.pow(10, 21.5 / 20)) / (peak(s) || 1), k2 = (rr * Math.pow(10, 1.5 / 20)) / (rms(s2, Math.round(0.001 * sr), i8) || 1);
+      filt(s, sr, 'hp', 850 * FM, 0.7); filt(s, sr, 'lp', Math.min(16000, 8400 * FM), 0.7); filt(s, sr, 'lp', Math.min(16000, 8400 * FM), 0.7);
+      for (let i = 0, k = Math.exp(-1 / (0.007 * TM * sr)), e = 1; i < ns; i++, e *= k) s2[i] = (r() * 2 - 1) * e;
+      filt(s2, sr, 'hp', Math.min(15000, 6000 * FM), 0.7); filt(s2, sr, 'lp', Math.min(16000, 4750 * FM), 0.7); filt(s2, sr, 'lp', Math.min(16000, 4750 * FM), 0.7);
+      const k1 = (rr * Math.pow(10, 23 / 20)) / (peak(s) || 1), k2 = (rr * Math.pow(10, 1.5 / 20)) / (rms(s2, Math.round(0.001 * sr), i8) || 1);
       for (let i = 0; i < ns; i++) x[i] += s[i] * k1 + s2[i] * k2;
-      // 5) 最後 0.15 秒淡出、峰值 = 這一下的音量
-      done(x, sr, 0.15);
+      // 5) 最後約 0.13 秒淡出、峰值 = 這一下的音量
+      done(x, sr, Math.min(0.15, 0.42 * 0.3));
       for (let i = 0; i < n; i++) x[i] *= lv;
       return x;
     },
@@ -968,7 +968,7 @@ const SFX_SYN = (() => {
 // 每種聲音：nv 先算幾個版本、gain 音量（讓各種聲音聽起來差不多大）、jit 每次隨機的音高差、
 // tau 衰減時間（同時太多聲音時用來估計哪個最小聲）、soft 輕輕撞時聲音變悶（像真的撞擊）
 const SFX_KIND = {
-  clack: { nv: 8, gain: 0.8, jit: 0.005, tau: 0.09, soft: true },
+  clack: { nv: 8, gain: 0.8, jit: 0.005, tau: 0.055, soft: true },
   tink: { nv: 8, gain: 0.8, jit: 0.02, tau: 0.06, soft: true },
   tick: { nv: 4, gain: 0.6, jit: 0.05, tau: 0.005, soft: true },
   pop: { nv: 5, gain: 0.3, jit: 0.06, tau: 0.02 },
@@ -1347,8 +1347,11 @@ const SfxLead = {
    f.lang：'en' 時畫面上的字請畫英文，其他（'zh'、舊版核心沒有 f.lang）畫中文；每一格都可能變（使用者切換語言時馬上生效）。
    名稱和說明寫中文；英文名稱和說明在 src-anims/zz-i18n-en.js（tools/i18n-build.js 產生，見那個檔案的說明）。
    f.mouse = { x, y（格子座標）, on, moved, down（左鍵按著）, clicks（這一格之間按下的 {x, y, button}，畫完自動清掉）,
-               wheel（滾輪累計）, idle（距離上次操作幾秒；沒人操作過是 Infinity） }
+               wheel（滾輪累計）, idle（距離上次操作幾秒；沒人操作過是 Infinity）, rdown（右鍵按著，只有 rightDrag 的動畫才會是 true） }
    互動桌布（interactive: true）：idle 超過幾秒就自己玩（示範模式），有人移動或點擊就交給玩家。
+   右鍵：一律不要用（在桌面上按右鍵是 Windows 的桌面選單）。唯一的例外：註冊時寫了 rightDrag: true（基本動畫或變化款都可以）的動畫
+   可以用 f.mouse.rdown 做「按住右鍵拖曳轉動視角」這類操作。桌布播放器只在這種桌布的螢幕上把桌面的右鍵拖曳轉給頁面，
+   單純點一下右鍵仍會叫出桌面選單；全螢幕預覽和桌布裡，這種動畫的畫面上也不會跳出瀏覽器的右鍵選單。其他動畫的 rdown 永遠是 false。
    音效：f.sfx(種類, 音量 0–1, 位置, 音高倍率)，種類見 Sfx.KINDS（clack 大鋼珠相撞的「鏘」、tink 小鋼珠的「嚓」、tick、pop、blip、thud、chime）。
    位置：數字 = 左右 -1–1；物件 {x, y, z} = 3D 位置，單位公尺、相對於鏡頭：x 往右、y 往上、z = 在鏡頭前方多遠（負的在背後），
    例如 f.sfx('clack', 0.8, { x: -0.3, y: 0, z: 1.5 })。3D 的聲音會依方向定位、越遠越小聲越悶、殘響越多（距離限制在 0.2–30 公尺）。
@@ -33104,6 +33107,12 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
   const SND_MIN = 0.05;     // 接近速度不到示範時單顆球的 5%：不出聲
   const SND_MIN_HELD = 0.2; // 其中一顆被拿著（滑鼠或示範的手）：要 20% 以上才出聲（拿著球推一整排時，滑鼠一頓一頓的，球會一直輕輕彈開又靠回來）
   const SND_D = 1.3, SND_K = 0.16;   // 聽起來的位置：鏡頭看著的那一點在聽者正前方 1.3 公尺，1 單位（球的半徑）= 0.16 公尺
+  // 滑鼠：按下時游標離球心不到 PICK_R 倍球的視半徑就抓得到（正好點在球上的優先）；按住右鍵拖曳轉動視角
+  const PICK_R = 1.6;
+  const PIT_MIN = 0.02, PIT_MAX = 1.05;   // 右鍵拖曳時鏡頭的仰角範圍（弧度）：最低幾乎平視（不會跑到底座下面），最高約 60°（不會翻過頭頂）
+  const UV_HOLD = 20;                     // 最後一次操作後，轉過的視角再留 20 秒，然後慢慢回到示範的鏡頭路線
+  const RING_GAP = 0.16, RING_MIN = 1.2, RING_MAX = 2.4;   // 「會抓到這顆」的圓圈在球的輪廓外面幾格（球的視半徑的 16%，限制在 1.2–2.4 格）
+  const RIM_CH = '()_/|' + BSL + MAC + HLN;                  // 球的輪廓用到的字元（著色的球面只用 RAMP 裡的字元）
 
   // 線條字元：phi 是線段在畫面上的方向角（度，0 = 水平，往右上為正），off 是線在格子裡偏離中心的位置（-0.5..0.5，往下／往右為正）
   // vert = 這條線是一列一格（off 是左右位置）；否則是一欄一格（off 是上下位置）；curved = 球的輪廓
@@ -33404,12 +33413,62 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
   }
   // 這個角度下剛好放得進畫面（留邊）的焦距
   function fitF(s, f) { return Math.min(s.fitW * s.availW / (s.bu1 - s.bu0), s.fitH * s.availH * f.aspect / (s.bv1 - s.bv0)); }
-  function setCamera(s, f) {
+  // ── 使用者轉過的視角（按住右鍵拖曳）──
+  // s.uv = 使用者的視角在用；s.uw = 它的份量（1 = 完全是使用者的視角，回到示範時慢慢降到 0）；s.uE = 回去示範走了多久（0 = 還留著）；
+  // s.uS = 回去的速度（半路上有人回來時很快降到 0）。uYaw/uPit/uDist = 使用者的鏡位（uYawT/uPitT = 拖曳的目標），udy = uYaw - 示範的方位角
+  // 從「現在畫面上的樣子」開始（鏡位、焦距、置中都接著用），所以剛按下右鍵、或回去的半路上又有人操作時，畫面都不會跳
+  function camGrab(s) {
+    s.uv = 1; s.uE = 0; s.uw = 1; s.uS = 1; s.ubu = s.cbu; s.ubv = s.cbv;
+    s.uYaw = s.uYawT = s.vyaw; s.uPit = s.vpit; s.uPitT = clamp(s.vpit, PIT_MIN, PIT_MAX); s.uDist = s.vdist;
+    const d = s.vyaw - s.dyaw; s.udy = d - TAU * Math.round(d / TAU);
+    s.uF = s.uF0 = s.Fd;
+  }
+  // 每格：跟著拖曳的目標慢慢轉過去（阻尼）；最後一次操作 UV_HOLD 秒後，花幾秒（轉得越多越久）平順地混回示範的鏡頭路線。
+  // 「最後一次操作」用 s.uIdle：按著滑鼠（抓著球、按著右鍵）不動也算還在操作
+  function userCam(s, dt) {
+    if (s.uE > 0 || s.uIdle >= UV_HOLD) {
+      // 開始回去：走最近的那一邊（轉了好幾圈也不會倒著轉回去），轉得越多花越久
+      if (s.uE === 0) { s.udy -= TAU * Math.round(s.udy / TAU); s.uDur = clamp(2.5 + 2.2 * Math.hypot(s.udy, s.uPit - s.dpit), 2.5, 10); s.uZ = s.zoomU; s.uS = 1; }
+      // 回去的半路上又有人來了：和示範的鏡頭一樣很快地停下來（約 0.2 秒），停住的樣子就是新的視角
+      if (s.uIdle < UV_HOLD) s.uS *= Math.exp(-dt * 6);
+      if (s.uS < 0.01) camGrab(s);
+      else {
+        s.uE += dt * s.uS;
+        const e = Math.min(1, s.uE / s.uDur);
+        s.uw = 1 - e * e * e * (e * (e * 6 - 15) + 10);
+        s.zoomU = 1 + (s.uZ - 1) * s.uw;   // 滾輪縮放也跟著一起回去
+        if (e >= 1) { s.uv = 0; s.uw = 0; s.zoomU = 1; s.pyaw = s.dyaw; s.ppit = s.dpit; s.pdist = s.ddist; return; }   // 回到示範的鏡頭路線了
+      }
+    }
+    const k = 1 - Math.exp(-dt * 12);
+    s.uYaw += (s.uYawT - s.uYaw) * k; s.uPit += (s.uPitT - s.uPit) * k;
+    // 使用者和示範鏡頭的方位角差 udy = uYaw - 示範的方位角：連續追蹤（示範的環繞鏡頭繞完一圈、方位角少掉 360° 時也不會跳）
+    const d = s.uYaw - s.dyaw - s.udy; s.udy += d - TAU * Math.round(d / TAU);
+    const w = s.uw;
+    s.pyaw = s.uYaw - s.udy * (1 - w); s.ppit = s.dpit + (s.uPit - s.dpit) * w; s.pdist = s.ddist + (s.uDist - s.ddist) * w;
+  }
+  function setCamera(s, f, dt) {
     const A = f.aspect;
     camBasis(s); camBox(s);
     // 焦距：init 裡算好的平滑表（見 buildFrameTable）
-    const F0 = frameF(s, s.tau);
-    const cx0 = f.cols / 2 - F0 * (s.bu0 + s.bu1) / 2, cy0 = s.availCy + F0 * (s.bv0 + s.bv1) / (2 * A);
+    let F0 = frameF(s, s.tau), cx0, cy0;
+    if (s.uv) {
+      // 使用者轉過的視角：焦距接著用轉之前的；轉到整座擺放不下的角度才慢慢拉遠（回到示範時跟著混回平滑表）
+      s.uF += (Math.min(s.uF0, 0.985 * fitF(s, f)) - s.uF) * (1 - Math.exp(-dt * 3));
+      F0 += (s.uF - F0) * s.uw;
+      // 置中：外框的中心在換成另一個角落時會突然轉向（例如從側面轉到正對兩端），轉動視角時用稍微慢一點跟上的中心，
+      // 畫面才不會頓一下；快回到示範時再慢慢換回外框的中心
+      let bu = (s.bu0 + s.bu1) / 2, bv = (s.bv0 + s.bv1) / 2;
+      const k = 1 - Math.exp(-dt * 5), q = Math.min(1, s.uw * 3);
+      s.ubu += (bu - s.ubu) * k; s.ubv += (bv - s.ubv) * k;
+      bu += (s.ubu - bu) * q; bv += (s.ubv - bv) * q;
+      s.cbu = bu; s.cbv = bv;
+      cx0 = f.cols / 2 - F0 * bu; cy0 = s.availCy + F0 * bv / A;
+    } else {
+      cx0 = f.cols / 2 - F0 * (s.bu0 + s.bu1) / 2; cy0 = s.availCy + F0 * (s.bv0 + s.bv1) / (2 * A);
+      s.cbu = (s.bu0 + s.bu1) / 2; s.cbv = (s.bv0 + s.bv1) / 2;
+    }
+    s.Fd = F0; s.vyaw = s.pyaw; s.vpit = s.ppit; s.vdist = s.pdist;   // 畫面上的樣子（camGrab 從這裡開始）
     // 滾輪放大時以球列為中心
     const Z = s.zoomU;
     const qx = -s.ex, qy = s.c0 + 0.9 - s.ey, qz = -s.ez, zc = qx * s.fx + qy * s.fy + qz * s.fz;
@@ -33719,6 +33778,47 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
       }
     }
   }
+  // 有人在玩、手上沒有球時：「按下去會抓到的那顆球」（見 pick）的輪廓改成最亮的顏色，外面再畫一圈亮的圓圈
+  // （和輪廓同樣的畫法，半徑比球的輪廓大一兩格；圓圈在球心的深度，被前面的東西擋住、或落在其他球上的地方不畫）
+  function hoverRing(s, f, i) {
+    const A = f.aspect, cols = f.cols, zb = s.zb, ch = f.g.ch, co = f.g.co, uu = s.uu, rbv = s.rbv;
+    const Cx = s.bcx[i], Cy = s.bcy[i];
+    const qx = Cx - s.ex, qy = Cy - s.ey, qz = -s.ez;
+    const cx = qx * s.rx + qy * s.ry + qz * s.rz, cy = qx * s.ux + qy * s.uy + qz * s.uz, cz = qx * s.fx + qy * s.fy + qz * s.fz;
+    const Cl = Math.hypot(cx, cy, cz);
+    if (Cl <= 1.05 || cz <= 0.5) return;
+    const ta = 1 / Math.sqrt(Cl * Cl - 1), gap = clamp(ta * s.F * RING_GAP, RING_MIN, RING_MAX), ah = Math.atan(ta + gap / s.F);
+    const cosA = Math.cos(ah), Rh = Cl * Math.sin(ah) + 0.05;
+    if (!rect(s, f, Cx - Rh, Cy - Rh, -Rh, Cx + Rh, Cy + Rh, Rh, 2)) return;
+    const x0 = s.x0, x1 = s.x1, y0 = s.y0, y1 = s.y1, w = x1 - x0 + 1, fb = s.fb, ob = s.ob, col = s.cHi;
+    for (let y = y0; y <= y1; y++) {
+      const v = rbv[y];
+      for (let x = x0; x <= x1; x++) {
+        const u = uu[x], k = y * cols + x;
+        fb[(y - y0) * w + (x - x0)] = (u * cx + v * cy + cz) / (Math.sqrt(1 + u * u + v * v) * Cl) - cosA;
+        if (ob[k] === i && RIM_CH.includes(ch[k])) co[k] = col;   // 這顆球自己的輪廓也改成最亮的顏色
+      }
+    }
+    for (let y = y0 + 1; y < y1; y++) {
+      for (let x = x0 + 1; x < x1; x++) {
+        const kb = (y - y0) * w + (x - x0), fv = fb[kb];
+        const gx = (fb[kb + 1] - fb[kb - 1]) * 0.5, gyv = (fb[kb + w] - fb[kb - w]) * 0.5 / A;
+        const gl = Math.sqrt(gx * gx + gyv * gyv);
+        if (gl < 1e-12) continue;
+        const sd = -fv / gl;
+        if (sd > 2.2 || sd < -2.2 * A) continue;
+        const nx = -gx / gl, ny = -gyv / gl;
+        let off;
+        const hz = Math.abs(ny) >= Math.abs(nx) / A;
+        if (hz) { off = (-sd / ny) / A; } else { off = -sd / nx; }
+        if (!(off >= -0.5 && off < 0.5)) continue;
+        const k = y * cols + x;
+        if (zb[k] < cz || ob[k] >= 0) continue;
+        let phi = Math.atan2(-nx, -ny) * 57.29578; if (phi < 0) phi += 180; if (phi >= 180) phi -= 180;
+        ch[k] = lineCh(phi, off, !hz, true, nx < 0 ? -1 : 1); co[k] = col;
+      }
+    }
+  }
 
   function buildColors(s, f) {
     s.lastC = f.C; s.lastH = f.H;
@@ -33744,6 +33844,7 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
     s.cEdgeHi = brass ? f.H(34, 0.62) : f.C(0.56);
     s.cCap = f.C(0.42);
     s.cArc = f.C(0.3); s.cArcHi = f.C(0.5);
+    s.cHi = f.C(1);
   }
 
   function render(s, f) {
@@ -33788,11 +33889,16 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
         line3(s, f, s.px[i], s.Hp, ez >= 0 ? s.zr : -s.zr, tx, ty, 0, cN, -9, 0, -1, true);
       }
     }
-    if (s.playing && (s.hover >= 0 || s.drag)) swingArc(s, f, s.drag ? s.drag.i : s.hover, !!s.drag);
+    if (s.playing && s.drag) swingArc(s, f, s.drag.i, true);
     const ord = s.ord;
     for (let i = 0; i < n; i++) { ord[i] = i; const qx = s.bcx[i] - s.ex, qy = s.bcy[i] - s.ey, qz = -s.ez; s.bcz[i] = qx * s.fx + qy * s.fy + qz * s.fz; }
     for (let a = 1; a < n; a++) { const v = ord[a]; let b = a - 1; while (b >= 0 && s.bcz[ord[b]] < s.bcz[v]) { ord[b + 1] = ord[b]; b--; } ord[b + 1] = v; }
     if (s.contour) for (let q = 0; q < n; q++) sphereContour(s, f, ord[q]);
+    // 手上沒有球時：「現在按下去會抓到的那顆球」（pick）用這一格畫好的畫面來找，和下一格按下時抓到的一定是同一顆；
+    // 畫出它可以擺動的弧線（只畫在空白的格子），有人在玩時再加上亮的輪廓和外圈
+    const m = f.mouse;
+    s.hover = s.playing && !s.drag && m && m.on && !m.down ? pick(s, f, m.x, m.y) : -1;
+    if (s.hover >= 0) { swingArc(s, f, s.hover, false); if (s.idle < 6) hoverRing(s, f, s.hover); }
   }
 
   // 逐格著色：球（鏡面金屬）、底座、夠粗的金屬桿
@@ -33950,7 +34056,8 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
 
   // ── 滑鼠 ──
   // 點選：先看游標那一格畫的是哪顆球（和畫面完全一致，連輪廓那一格也算），
-  // 沒有的話用同一條光線做精確的球面測試（例如球被細桿擋住），最後是差不到一格的寬容範圍
+  // 沒有的話用同一條光線做精確的球面測試（例如球被細桿擋住）；都沒打中就是寬容範圍：
+  // 從相機看，游標和球心的夾角不到 PICK_R 倍球的視半徑（角半徑）的球裡，取倍數最小的那一顆（遠近不同的球一樣寬容），再遠就不抓
   function pick(s, f, mx, my) {
     const A = f.aspect, u = (mx - s.ccx) / s.F, v = (s.ccy - my) * A / s.F;
     const dx = s.fx + u * s.rx + v * s.ux, dy = s.fy + u * s.ry + v * s.uy, dz = s.fz + u * s.rz + v * s.uz;
@@ -33958,28 +34065,25 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
     const cx = Math.floor(mx), cy = Math.floor(my);
     let hit = -1;
     if (cx >= 0 && cy >= 0 && cx < f.cols && cy < f.rows) { const o = s.ob[cy * f.cols + cx]; if (o >= 0 && o < s.n) hit = o; }
-    let best = 1e9, bi = -1, near = -1, nd = 1;
+    let best = 1e9, bi = -1, near = -1, nq = PICK_R;
     for (let i = 0; i < s.n; i++) {
       const ox = s.ex - s.bcx[i], oy = s.ey - s.bcy[i], oz = s.ez;
       const b = dx * ox + dy * oy + dz * oz, c = ox * ox + oy * oy + oz * oz - 1, h = b * b - a * c;
       if (h >= 0) { const t = (-b - Math.sqrt(h)) / a; if (t > 0 && t < best) { best = t; bi = i; } }
-      else {
-        // 光線離球面多遠（換成格子）
-        const tm = -b / a, gap = Math.sqrt(Math.max(0, c + 1 - b * b / a)) - 1;
-        const cells = gap * s.F / Math.max(0.5, tm * Math.sqrt(a));
-        if (tm > 0 && cells < nd) { nd = cells; near = i; }
+      else if (b < 0 && c > 0.01) {
+        // 光線和「相機 → 球心」的夾角是球的角半徑的幾倍
+        const D = Math.sqrt(c + 1), q = Math.acos(Math.min(1, -b / (Math.sqrt(a) * D))) / Math.asin(1 / D);
+        if (q < nq) { nq = q; near = i; }
       }
     }
     if (hit < 0) hit = bi >= 0 ? bi : near;
     if (hit < 0) return -1;
-    // 抓住的那一點：光線打到球面的點；擦過的話取球面上離光線最近的點
+    // 抓住的那一點：光線打到球面的點；沒打到球面（擦過或在球旁邊）就取光線上離球心最近的點：
+    // 這一點就在游標底下，跟著球一起轉，拖動時它跟著游標走，球不會一抓就跳過去
     const ox = s.ex - s.bcx[hit], oy = s.ey - s.bcy[hit], oz = s.ez;
     const b = dx * ox + dy * oy + dz * oz, c = ox * ox + oy * oy + oz * oz - 1, h = b * b - a * c;
-    if (h >= 0) { const t = (-b - Math.sqrt(h)) / a; s.gpx = s.ex + t * dx; s.gpy = s.ey + t * dy; s.gpz = s.ez + t * dz; }
-    else {
-      const t = -b / a, qx = s.ex + t * dx - s.bcx[hit], qy = s.ey + t * dy - s.bcy[hit], qz = s.ez + t * dz, ql = Math.hypot(qx, qy, qz) || 1;
-      s.gpx = s.bcx[hit] + qx / ql; s.gpy = s.bcy[hit] + qy / ql; s.gpz = qz / ql;
-    }
+    const t = h >= 0 ? (-b - Math.sqrt(h)) / a : -b / a;
+    s.gpx = s.ex + t * dx; s.gpy = s.ey + t * dy; s.gpz = s.ez + t * dz;
     return hit;
   }
   // 找出讓「抓住的那一點」投影最接近滑鼠的角度
@@ -34028,9 +34132,12 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
   }
   function input(s, f) {
     const m = f.mouse;
-    if (!m) { s.playing = false; return; }
+    if (!m) { s.playing = false; s.idle = Infinity; s.uIdle = Infinity; return; }
     const idle = typeof m.idle === 'number' && m.idle === m.idle ? m.idle : Infinity;
-    const playing = idle < 6 || (!!m.down && idle < 60);
+    s.idle = idle;
+    // 轉過的視角要留多久（見 userCam）：按著滑鼠不動時 idle 不會更新，按著就當作一直在操作（和下面的 playing 一樣最多 60 秒）
+    s.uIdle = (m.down || m.rdown) && idle < 60 ? 0 : idle;
+    const playing = idle < 6 || ((!!m.down || !!m.rdown) && idle < 60);
     if (playing && !s.playing) {
       // 玩家接手：看不見的手放開
       if (s.ph === 'lift' || s.ph === 'hold' || s.ph === 'calm') releaseAll(s);
@@ -34039,8 +34146,24 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
     // 玩家離開：讓球繼續擺一下再接手示範；說明文字先不寫顆數（還在擺的是玩家放的球，不是上一個示範花樣）
     if (!playing && s.playing) { if (s.drag) endDrag(s); s.ph = 'swing'; s.pt = 0; s.swingT = 5; s.hover = -1; s.curPat = null; }
     s.playing = playing;
-    const down = !!m.down, clicks = m.clicks || [];
-    if (!playing) { s.wasDown = down; return; }
+    const down = !!m.down, clicks = m.clicks || [], rd = !!m.rdown;
+    if (!playing) { s.wasDown = down; s.wasR = rd; return; }
+    // 按住右鍵拖曳：轉動視角（左右 = 繞著牛頓擺轉，上下 = 抬高、降低鏡頭）。拖過一個螢幕高度大約轉半圈；
+    // 開始拖動時從畫面上現在的視角開始（示範的鏡頭停在那裡，正在回去的話就停在半路）。按下右鍵沒有拖動（單純點一下右鍵，
+    // 桌面上會叫出桌面選單）不算轉動視角
+    if (rd) {
+      if (!s.wasR) s.rPend = 1;
+      else if (m.x !== s.rlx || m.y !== s.rly) {
+        s.rPend = 0;
+        if (!s.uv || s.uE > 0) camGrab(s);
+        const S = Math.max(8, Math.min(f.cols, f.rows * f.aspect));
+        s.uYawT -= Math.PI * (m.x - s.rlx) / S;
+        s.uPitT = clamp(s.uPitT + Math.PI * (m.y - s.rly) * f.aspect / S, PIT_MIN, PIT_MAX);
+      }
+      s.rlx = m.x; s.rly = m.y;
+    }
+    s.wasR = rd;
+    if (s.uv && s.uE > 0 && (down || m.wheel)) camGrab(s);
     if (m.wheel && !s.drag && !down) s.zoomU = clamp(s.zoomU * Math.exp(-m.wheel * 0.0012), 0.75, 1.5);
     // 按下：用點擊事件的位置（按下的那一刻）；只有「按住」沒有點擊事件時，就用目前位置
     if (down && !s.drag) {
@@ -34065,18 +34188,19 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
         nudge(s, hit, (s.gpx - s.bcx[hit]) * Math.cos(s.th[hit]) + (s.gpy - s.bcy[hit]) * Math.sin(s.th[hit]));
       }
     }
-    s.hover = !s.drag && m.on && !down ? pick(s, f, m.x, m.y) : -1;
     s.wasDown = down;
   }
 
   const SEED = ['tau', 'cspd', 'zoomU', 'time', 'pt', 'liftT', 'swingT', 'acc', 'Eref', 'gpx', 'gpy', 'gpz', 'rrE', 'F', 'ccx', 'ccy', 'ex', 'ey', 'ez',
     'fx', 'fy', 'fz', 'rx', 'ry', 'rz', 'ux', 'uy', 'uz', 'pyaw', 'ppit', 'pdist', 'bu0', 'bu1', 'bv0', 'bv1', 'w2', 'damp', 'rest', 'vrest', 'ctol',
     'ecap', 'L', 'Hp', 'c0', 'rr', 'yR', 'zr', 'X', 'bxw', 'bzw', 'bh', 'tgtY', 'baseK', 'sp', 'r', 'fsp', 'thMax', 'availW', 'availH', 'availCy', 'fitW', 'fitH', 'sx', 'sy',
-    'evSV', 'evSX', 'evSY', 'evSW'];
+    'evSV', 'evSX', 'evSY', 'evSW', 'idle', 'uIdle', 'uE', 'uw', 'uDur', 'uZ', 'uS', 'ubu', 'ubv', 'cbu', 'cbv', 'uYaw', 'uYawT', 'uPit', 'uPitT', 'uDist', 'udy', 'uF', 'uF0', 'Fd', 'dyaw', 'dpit', 'ddist',
+    'vyaw', 'vpit', 'vdist', 'rlx', 'rly'];
 
   A({
     id: 'cradle3d', name: '3D 牛頓擺', cat: '遊戲', theme: 'mono', hue: false, interactive: true, sound: true,
-    desc: '會慢慢轉換視角的立體金屬牛頓擺；按住一顆球往外拉再放手，滾輪縮放',
+    rightDrag: true,   // 按住右鍵拖曳轉動視角（f.mouse.rdown；全部變化款都是）
+    desc: '會慢慢轉換視角的立體金屬牛頓擺；按住一顆球往外拉再放手，按住右鍵拖曳轉動視角，滾輪縮放',
     // 擺動週期 1.1 秒：示範時大約每 0.55 秒「鏘」一聲，接近音效參考的大型牛頓擺錄音（每 0.537 秒一聲）；黃銅款刻意慢一點
     params: { n: 5, len: 5.4, period: 1.1, cam: 'hero', mat: 'chrome', contour: true, floor: true },
     variants: [
@@ -34115,6 +34239,9 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
       s.playing = false; s.wasDown = false; s.drag = null; s.hover = -1; s.time = 0; s.gpx = 0; s.gpy = 0; s.gpz = 0;
       // 相機與光
       s.camMode = p.cam; s.tau = 0; s.cspd = 1; s.zoomU = 1;
+      // 使用者轉過的視角（見 camGrab、userCam）：一開始沒有；d* = 示範鏡頭的鏡位，v* = 畫面上的鏡位
+      s.uv = 0; s.uE = 0; s.uw = 0; s.uDur = 0; s.uZ = 1; s.uS = 1; s.ubu = 0; s.ubv = 0; s.cbu = 0; s.cbv = 0; s.uYaw = 0; s.uYawT = 0; s.uPit = 0; s.uPitT = 0; s.uDist = 0; s.udy = 0; s.uF = 0; s.uF0 = 0; s.Fd = 0;
+      s.dyaw = 0; s.dpit = 0; s.ddist = 0; s.vyaw = 0; s.vpit = 0; s.vdist = 0; s.wasR = false; s.rPend = 0; s.rlx = 0; s.rly = 0; s.idle = Infinity; s.uIdle = Infinity;
       if (s.camMode === 'orbit') buildOrbit(s);
       const L = Math.hypot(-0.45, 0.8, 0.5); s.lkx = -0.45 / L; s.lky = 0.8 / L; s.lkz = 0.5 / L;
       const L2 = Math.hypot(0.75, 0.3, -0.6); s.lrx = 0.75 / L2; s.lry = 0.3 / L2; s.lrz = -0.6 / L2;
@@ -34140,7 +34267,7 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
       // 一開始就是「剛放開」的樣子，不用等
       startLift(s); for (let i = 0; i < n; i++) s.th[i] = s.tg[i];
       releaseAll(s); s.ph = 'swing'; s.pt = 0; s.swingT = 13;
-      poseAt(s, 0); setCamera(s, f);
+      poseAt(s, 0); s.dyaw = s.pyaw; s.dpit = s.ppit; s.ddist = s.pdist; setCamera(s, f, 0);
       for (let i = 0; i < n; i++) { s.bcx[i] = s.px[i] + s.L * Math.sin(s.th[i]); s.bcy[i] = s.Hp - s.L * Math.cos(s.th[i]); }
       // 會存小數的欄位先存一次小數、拖曳欄位先放一次物件：V8 一開始就用最後的欄位型別，
       // 第一次有人按滑鼠或第一次抬球時才不會整段程式重新最佳化（會卡一下）
@@ -34154,13 +34281,15 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
       simulate(s, dt);
       // 相機：有人在玩就停住（按著滑鼠時完全不動），沒人玩再慢慢動起來
       const tgt = s.playing ? 0 : 1;
-      if (s.drag || (f.mouse && f.mouse.down && s.playing)) s.cspd = 0;
+      if (s.drag || (f.mouse && (f.mouse.down || f.mouse.rdown) && s.playing)) s.cspd = 0;
       else s.cspd += (tgt - s.cspd) * (1 - Math.exp(-dt * (tgt < s.cspd ? 6 : 0.4)));
       if (s.cspd < 1e-3 && tgt === 0) s.cspd = 0;
-      if (!s.playing) s.zoomU += (1 - s.zoomU) * (1 - Math.exp(-dt * 0.5));
+      // 滾輪縮放：沒人玩就慢慢回到原來的大小（轉過的視角還在的時候由 userCam 處理：先留著，視角回去時一起回去）
+      if (!s.playing && !s.uv) s.zoomU += (1 - s.zoomU) * (1 - Math.exp(-dt * 0.5));
       s.tau += dt * s.cspd;
-      if (s.cspd > 0) poseAt(s, s.tau);
-      setCamera(s, f);
+      if (s.cspd > 0) { poseAt(s, s.tau); s.dyaw = s.pyaw; s.dpit = s.ppit; s.ddist = s.pdist; }
+      if (s.uv) userCam(s, dt);
+      setCamera(s, f, dt);
       if (s.evOpen && s.evAge > SND_FUSE) sndClose(s);
       if (s.evN) sndEmit(s, f);
       render(s, f);
@@ -34175,6 +34304,11 @@ A({ id: 'ga-scene', name: '小小風景', cat: '場景', theme: 'ocean', hue: tr
         // 英文比較長：放不下時先拿掉「Momentum conserved ·」，顆數和操作說明（寬度 70 以上一定有，和中文一樣）留著
         if (f.lang === 'en' && what && !fits(wide ? msg + hint : msg)) msg = what;
         txtC(g, f.rows - 1, msg + (wide && fits(msg + hint) ? hint : ''), s.cCap);
+      } else if (!s.drag && s.idle < 6 && f.cols >= 70) {
+        // 有人在玩、手上沒有球：同一列改成操作說明（放不下時先拿掉右鍵那一句；寬度不到 70 不顯示）
+        const g = f.g, fits = t => g.textW(t) + 4 <= f.cols;
+        const a = tr(f, '按住鋼球左右拉、放開就會擺動', 'Pull a ball sideways and let go'), b = tr(f, '・按住右鍵拖曳可轉動視角', ' · Right-drag to rotate the view');
+        if (fits(a + b)) txtC(g, f.rows - 1, a + b, s.cCap); else if (fits(a)) txtC(g, f.rows - 1, a, s.cCap);
       }
     },
   });
@@ -40311,7 +40445,7 @@ A({ id: 'ix-paint', name: '霓虹塗鴉', cat: '互動', theme: 'neon', hue: tru
       "ga-timer": {"name":"Calendar & Timers","desc":"A big calendar with today marked, flanked by the previous and next months"},
       "ga-skyline": {"name":"City Skyline","desc":"A city passes through a whole day, from daylight to night"},
       "ga-scene": {"name":"Little Scenes","desc":"A clifftop lighthouse sweeps its beam across the night sea"},
-      "cradle3d": {"name":"3D Newton's Cradle","desc":"A metal cradle as the camera slowly roams; pull a ball out and let go, scroll to zoom"},
+      "cradle3d": {"name":"3D Newton's Cradle","desc":"A metal cradle as the camera roams; pull a ball out, right-drag to turn, scroll to zoom"},
       "ix-whack": {"name":"Whack-a-Mole","desc":"Click moles as they pop up; hit streaks multiply your score; it plays itself when idle"},
       "ix-breakout": {"name":"Brick Smasher","desc":"Move the mouse to steer the paddle and click to serve; knock down the whole brick wall"},
       "ix-pong": {"name":"Paddle Duel","desc":"Move the mouse up and down to steer the right paddle against the computer; first to 7 wins"},
@@ -41245,6 +41379,7 @@ A({ id: 'ix-paint', name: '霓虹塗鴉', cat: '互動', theme: 'neon', hue: tru
       e.hue = v && v.hue !== undefined ? v.hue : b.hue;
       e.cat = (v && v.cat) || b.cat;
       if (v && v.sound !== undefined) e.sound = v.sound;
+      if (v && v.rightDrag !== undefined) e.rightDrag = v.rightDrag;   // 要右鍵拖曳（例如轉動 3D 視角），見上面「動畫作品庫」的說明
       e.params = Object.assign({}, b.params, v && v.params);
       if (ANIM_MAP[e.id]) { console.warn('重複的動畫 id：' + e.id); continue; }
       ANIMS.push(e); ANIM_MAP[e.id] = e;
@@ -41607,38 +41742,76 @@ function applyEffect(base, g, eff, st, t, dt) {
 /* ════════════════════ 播放器 ════════════════════ */
 const MAX_CANVAS_PX = 4.2e6;
 const DEFAULT_OPTS = { fontSize: 14, speed: 1, theme: 'default', glow: false, scan: false, fps: 30, sound: true };
+// 按在按鈕等介面上（不是畫面）：這種按下不算給動畫
+const onUiEl = t => !!(t && t.closest && t.closest('button, a, input, select, label, .vbar, dialog'));
 class Player {
   // o.measure() → {w, h, fp} 自訂尺寸；o.virtualW 模擬螢幕寬度（預覽用）；o.thumbCols 縮圖模式；o.sound 可以發出音效（只有全螢幕預覽和桌布）
   constructor(canvas, o = {}) {
     this.cv = canvas; this.o = o; this.r = new Renderer(canvas);
     this.opts = { ...DEFAULT_OPTS, ...(o.opts || {}) };
     this.src = null; this.s = {}; this.t = 0; this.last = 0; this.lastDraw = 0; this.visible = true; this.dirty = true;
-    this.mouse = { x: 0, y: 0, on: false, moved: false, down: false, clicks: [], wheel: 0, idle: Infinity, last: 0 };
+    this.mouse = { x: 0, y: 0, on: false, moved: false, down: false, rdown: false, clicks: [], wheel: 0, idle: Infinity, last: 0 };
     this.sound = !!o.sound; this.quiet = false;
     // f.sfx 一定是函式（動畫不用檢查）；不該發聲的時候什麼都不做
     const sfx = (kind, vol, pan, pitch) => { if (!this.quiet && this.soundOn()) Sfx.play(kind, vol, pan, pitch); };
     this.f = { g: this.r.g, cols: 1, rows: 1, aspect: 2, t: 0, dt: 0, C: null, H: null, bg: null, mouse: this.mouse, sfx, lang: LANG };
     this.est = {}; this.cache = new Map(); this.mt = 0; this.lkey = '';
+    this.extInput = false;   // 桌布播放器的滑鼠事件串流（watchInput）開著：這時不理 DOM 的滑鼠事件，同一個動作才不會算兩次
     if (o.interactive) {
-      // 桌布模式下，滑鼠是桌布播放器從桌面轉送過來的；在管理介面的全螢幕預覽裡則是真的滑鼠
-      const m = this.mouse;
-      const pos = e => {
-        const rect = this.cv.getBoundingClientRect(), k = this.cv.width / Math.max(1, rect.width);
-        m.x = ((e.clientX - rect.left) * k) / this.r.cw; m.y = ((e.clientY - rect.top) * k) / this.r.chh;
-        m.on = true; m.moved = true; m.last = performance.now();
-      };
-      const onUi = e => !!(e.target && e.target.closest && e.target.closest('button, a, input, select, label, .vbar, dialog'));
-      window.addEventListener('pointermove', pos);
-      window.addEventListener('pointerdown', e => {
-        pos(e);
-        if (e.button !== 0 || onUi(e)) return;   // 只算左鍵，點在按鈕等介面上的不算
-        m.down = true;
-        if (m.clicks.length < 32) m.clicks.push({ x: m.x, y: m.y, button: 0 });
+      // 桌布模式下，滑鼠是桌布播放器從桌面轉送過來的：新版播放器用事件串流（watchInput），舊版播放器（或串流斷線時）是假造的
+      // Win32 滑鼠訊息 → 下面的 DOM 事件；在管理介面的全螢幕預覽裡則是真的滑鼠（DOM 事件）。兩種都由 this.input 換算成 f.mouse
+      const m = this.mouse, dom = () => !this.extInput;
+      // 按下左鍵或右鍵：pointerdown，或已經按著別的鍵時再按（這時瀏覽器只送 button 有值的 pointermove，沒有 pointerdown）。點在按鈕等介面上的不算。
+      // 左鍵：down 和 clicks。右鍵只給要右鍵拖曳的動畫（rightDrag，例如轉動 3D 視角）：rdown；其他動畫的 rdown 永遠是 false
+      let rdMenu = false;   // 這次的右鍵是從畫面上按下去的：放開時的右鍵選單也要擋掉（就算放開時游標在預覽列上）
+      const press = e => { const rd = this.input('down', e.clientX, e.clientY, e.button, 0, onUiEl(e.target)); if (e.button === 2) rdMenu = rd; };
+      const release = e => this.input('up', NaN, NaN, e.button);   // 放開不更新位置
+      window.addEventListener('pointermove', e => {
+        if (!dom()) return;
+        this.input('move', e.clientX, e.clientY);
+        if (e.button === 0 || e.button === 2) { if (e.buttons & (e.button === 0 ? 1 : 2)) press(e); else release(e); }
+        else if (m.rdown && !(e.buttons & 2)) m.rdown = false;   // 漏掉了放開右鍵（例如轉送的桌布播放器重新啟動）：移動時右鍵沒按著就當作放開了
       });
-      window.addEventListener('pointerup', e => { if (e.button === 0) m.down = false; m.last = performance.now(); });
-      window.addEventListener('wheel', e => { pos(e); m.wheel += e.deltaY; }, { passive: true });
-      window.addEventListener('blur', () => { m.down = false; });
+      window.addEventListener('pointerdown', e => { if (dom()) press(e); });
+      window.addEventListener('pointerup', e => { if (dom()) release(e); });
+      window.addEventListener('wheel', e => { if (dom()) this.input('wheel', e.clientX, e.clientY, 0, e.deltaY); }, { passive: true });
+      // 視窗失去焦點時 DOM 事件可能收不到放開，當作放開了。事件串流有自己的放開（和 k），不用猜：
+      // 在桌面上按左鍵時焦點會跑到桌面，這時不能把正在按著的鍵放掉
+      window.addEventListener('blur', () => { if (dom()) { m.down = false; m.rdown = false; } });
+      // 要右鍵拖曳的動畫：畫面上不跳出瀏覽器的右鍵選單。只限桌布模式和全螢幕預覽的畫面（預覽列等介面、管理介面的其他地方照常）。
+      // 從畫面上按下的右鍵拖曳（rdMenu）放開時一律擋掉，就算拖曳中輪播或 ←→ 換到了沒有 rightDrag 的動畫也一樣；
+      // 由桌布播放器載入的桌布（WP.hosted）也一律擋掉：播放器只在右鍵拖曳時轉送右鍵，換動畫的瞬間 rd 還沒同步時也不能跳出 Edge 的選單
+      window.addEventListener('contextmenu', e => {
+        const wp = document.body.classList.contains('wp');
+        if (rdMenu || (wp && WP.hosted) || (this.visible && this.rightDrag() && !onUiEl(e.target) && (wp || this.cv.parentNode.contains(e.target)))) e.preventDefault();
+        rdMenu = false;
+      });
     }
+  }
+  // 一個滑鼠事件 → f.mouse（this.mouse）。DOM 的 pointer / wheel 事件和桌布播放器的事件串流（watchInput）都走這裡，規則才會一模一樣。
+  // type：'move' 'down' 'up' 'wheel'，或 'leave'（游標離開了桌面或這個螢幕、沒有按著鍵：on = false，idle 照算）。
+  // x, y：相對於網頁內容區左上角的 CSS 像素（同 clientX / clientY），不是有限數字就不更新位置。
+  // button：down / up 的鍵（0 左鍵、2 右鍵）；delta：滾輪（同 WheelEvent.deltaY：往下捲是正的）；ui：按在按鈕等介面上（不算按下）；
+  // held：現在按著哪些鍵（1 左、2 右；DOM 事件不給）：已經沒按著的鍵就當作放開了（漏掉的放開）。
+  // 回傳 true = 這次按下的右鍵算數（rdown；只有要右鍵拖曳的動畫才會）
+  input(type, x, y, button = 0, delta = 0, ui = false, held) {
+    const m = this.mouse;
+    if (type === 'leave') m.on = false;
+    else if (Number.isFinite(x) && Number.isFinite(y)) {
+      const rect = this.cv.getBoundingClientRect(), k = this.cv.width / Math.max(1, rect.width);
+      m.x = ((x - rect.left) * k) / this.r.cw; m.y = ((y - rect.top) * k) / this.r.chh;
+      m.on = true; m.moved = true; m.last = performance.now();
+    }
+    if (typeof held === 'number' && type !== 'down') { if (!(held & 1)) m.down = false; if (!(held & 2)) m.rdown = false; }
+    if (type === 'down') {
+      if (ui) return false;
+      if (button === 2) { if (!this.rightDrag()) return false; m.rdown = true; return true; }
+      if (button === 0) { m.down = true; if (m.clicks.length < 32) m.clicks.push({ x: m.x, y: m.y, button: 0 }); }
+    } else if (type === 'up') {
+      if (button === 0) m.down = false; else if (button === 2) m.rdown = false;
+      m.last = performance.now();
+    } else if (type === 'wheel' && Number.isFinite(delta)) m.wheel += delta;
+    return false;
   }
   setAnim(id) { this.dropMedia(); this.src = { type: 'anim', def: ANIM_MAP[id] || ANIMS[0] }; this.restart(); }
   setMedia(m, conv) {
@@ -41649,7 +41822,10 @@ class Player {
   dropMedia() { if (this.src && this.src.type === 'media' && this.src.m.kind === 'video') this.src.m.video.pause(); }
   setConv(c) { if (this.src && this.src.type === 'media') { Object.assign(this.src.conv, c); this.cache.clear(); this.tf = null; this.est = {}; this.dirty = true; } }
   setOpts(o) { Object.assign(this.opts, o); this.tf = null; this.dirty = true; }
-  restart() { this.s = {}; this.t = 0; this.inited = false; this.tf = null; this.est = {}; this.dirty = true; this.cache.clear(); this.lastKey = undefined; }
+  restart() {
+    this.s = {}; this.t = 0; this.inited = false; this.tf = null; this.est = {}; this.dirty = true; this.cache.clear(); this.lastKey = undefined;
+    if (!this.rightDrag()) this.mouse.rdown = false;   // 右鍵拖曳中途換到沒有 rightDrag 的動畫（或圖片、影片）：rdown 不能漏過去
+  }
   // 現在可以發出聲音嗎：這個播放器允許（全螢幕預覽、桌布）、選項沒關掉、音效開著、沒暫停、看得到，而且這個動畫有音效
   canSound() {
     const s = this.src;
@@ -41657,6 +41833,8 @@ class Player {
   }
   // 而且輪到這一頁發聲（同一個動畫同時當好幾個螢幕的桌布時只有一頁會響，見 SfxLead）
   soundOn() { return this.canSound() && SfxLead.ok(this); }
+  // 現在播的動畫要右鍵拖曳嗎（註冊時寫了 rightDrag: true，例如轉動 3D 視角；輪播時看正在播的那一個）
+  rightDrag() { const s = this.src; return !!s && s.type === 'anim' && !!s.def.rightDrag; }
   themeFns() {
     if (!this.tf) this.tf = this.src && this.src.type === 'media' ? themeFns(this.src.conv.theme, null) : themeFns(this.opts.theme, this.src && this.src.def);
     return this.tf;
@@ -43162,23 +43340,51 @@ function bindPlaylist() {
 }
 
 /* ════════════════════ 桌布模式（被桌布播放器或其他桌布軟體載入時） ════════════════════ */
-const WP = { player: null, rot: null };
+const WP = { player: null, rot: null, rdSync: null, wake: null, hosted: false, input: null };   // hosted：由 ASCII桌布播放器載入（#wpid=）；input：滑鼠事件串流的狀態（watchInput）；wake：叫 watchPlayer 馬上問播放器
 // 和桌布播放器保持一條長輪詢：狀態沒變時播放器會把請求留著，一有變化（換了桌布、被視窗蓋住、按了暫停）就立刻回覆。
 // 換了桌布就重新載入；暫停就停在最後一格。播放器沒回應（重新啟動中）時照常播放，稍後再連。
 // 音效開關（播放器的「桌布音效」）也走這條：s 是這一頁目前知道的開關，播放器那邊不一樣就立刻回覆。
 // 介面語言也是：l 是這一頁目前的語言，播放器回覆的 l 不一樣就馬上換（動畫畫的字看 f.lang，不用重新載入；舊版播放器沒有 l：照舊）。
+// 右鍵拖曳：現在播的動畫要右鍵拖曳（rightDrag，例如轉動 3D 視角）時加上 rd=1，播放器才會在這個螢幕上攔下桌面的右鍵拖曳轉給這一頁。
+// 輪播換到 rd 不一樣的動畫時（WP.rdSync）中斷正在等的長輪詢，馬上用新的 rd 再問一次（舊版播放器不認得 rd：照舊）。
+// 滑鼠事件串流（watchInput）連著時不留著長輪詢：所有桌布的 Edge 共用一個設定檔，Chromium 對同一個主機最多只開 6 條連線，
+// 每頁兩條一直開著的連線（長輪詢 + 串流）的話，3 個螢幕就把連線用完了（其他請求都要等長輪詢回來），更多螢幕連頁面都載入不了。
+// 所以這時改問 /api/wait?nowait=1（播放器立刻回覆）：串流連上時、播放器從串流送來 wake（狀態可能變了）時、rd 變了時，
+// 和每 20 秒（播放器才知道這一頁還活著）各問一次；串流斷了就馬上改回長輪詢。
+// 串流被播放器拒絕（503：已經有 5 個螢幕連著串流，見 watchInput）時也不留著長輪詢（5 條串流 + 長輪詢 = 6 條，其他請求都要等），每 3 秒快速詢問一次。
 async function watchPlayer(wpid, v0) {
-  let paused = false, sound = true, known = false, langSaved = false;
-  // 還不知道播放器的音效開關之前先不發聲（關著的時候第一聲才不會漏出來）。開關一致時第一次輪詢會被留著，
-  // 所以一小段時間沒回覆就表示是開著的（舊版播放器也一律當作開著）
+  let paused = false, sound = true, known = false, langSaved = false, ctl = null, rdSent = false;
+  let parked = false, again = false, kick = null;   // parked：現在等的是長輪詢；again：問完馬上再問一次；kick：結束兩次詢問之間的等待
+  const rdNow = () => !!(WP.player && WP.player.rightDrag());
+  const live = () => !!(WP.input && WP.input.state === 'live');
+  const busy = () => !!(WP.input && WP.input.busy && WP.input.state !== 'live');   // 串流被拒絕（太多螢幕）
+  // 馬上再問一次：中斷正在等的長輪詢（快速詢問就等它回來），或結束兩次詢問之間的等待
+  const poke = () => { again = true; if (ctl && parked) ctl.abort(); if (kick) kick(); };
+  const idle = ms => new Promise(res => {
+    const t = setTimeout(() => { kick = null; res(); }, ms);
+    kick = () => { clearTimeout(t); kick = null; res(); };
+  });
+  WP.rdSync = () => { if (rdNow() !== rdSent) poke(); };
+  WP.wake = poke;
   Sfx.enabled = false;
+  await null;   // 先讓桌布設定好第一個動畫（startWallpaper 接下來就做），第一次輪詢的 rd 才是對的；watchInput 也在這時開始連線
+  // 串流通常幾十毫秒內就連上：先等它一下（最多半秒），免得每次載入都先留一個馬上又要中斷的長輪詢
+  if (WP.input && WP.input.state === 'connecting') await idle(500);
+  // 還不知道播放器的音效開關之前先不發聲（關著的時候第一聲才不會漏出來）。開關一致時第一次長輪詢會被留著，
+  // 所以一小段時間沒回覆就表示是開著的（舊版播放器也一律當作開著；快速詢問會馬上回覆）
   setTimeout(() => { if (!known) { known = true; Sfx.enabled = true; SfxLead.sync(); } }, 800);
   for (;;) {
     try {
-      const r = await fetch(`/api/wait?mon=${encodeURIComponent(wpid)}&v=${encodeURIComponent(v0 || '')}&p=${paused ? 1 : 0}&s=${sound ? 1 : 0}&l=${LANG}`, { cache: 'no-store' });
-      if (r.status === 404) { known = true; Sfx.enabled = true; return legacyVersionPoll(wpid, v0); } // 舊版播放器沒有 /api/wait
+      rdSent = rdNow();
+      parked = !live() && !busy();
+      again = false;
+      ctl = typeof AbortController === 'function' ? new AbortController() : null;
+      const r = await fetch(`/api/wait?mon=${encodeURIComponent(wpid)}&v=${encodeURIComponent(v0 || '')}&p=${paused ? 1 : 0}&s=${sound ? 1 : 0}&l=${LANG}${rdSent ? '&rd=1' : ''}${parked ? '' : '&nowait=1'}`,
+        { cache: 'no-store', signal: ctl ? ctl.signal : undefined });
+      if (r.status === 404) { ctl = null; known = true; Sfx.enabled = true; return legacyVersionPoll(wpid, v0); } // 舊版播放器沒有 /api/wait
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const j = await r.json();
+      ctl = null;
       if (v0 === null) v0 = j.v;
       else if (j.v !== v0) { location.reload(); return; }
       paused = !!j.p;
@@ -43190,7 +43396,12 @@ async function watchPlayer(wpid, v0) {
       }
       Loop.setPaused(paused);
       SfxLead.sync();   // 暫停或不能發聲時馬上讓出，另一個螢幕上的同一個動畫可以接手
+      // 快速詢問：等到下一個 wake（或 rd 變了、串流斷了），最多 20 秒；串流被拒絕時 3 秒
+      if (!parked && !again && (live() || busy())) await idle(live() ? 20000 : 3000);
     } catch (e) {
+      const aborted = !!(ctl && ctl.signal.aborted);
+      ctl = null;
+      if (aborted) continue;   // 我們自己中斷的（rd 變了、串流連上了）：狀態照舊，馬上重問
       paused = false;
       Loop.setPaused(false);
       if (!known) { known = true; Sfx.enabled = true; }
@@ -43198,6 +43409,93 @@ async function watchPlayer(wpid, v0) {
       await sleep(1500);
     }
   }
+}
+// 桌布播放器直接送來的滑鼠事件（Server-Sent Events：GET /api/input?mon=）。
+// 以前播放器把桌面上的滑鼠假造成 Win32 滑鼠訊息 PostMessage 給 Edge，但游標底下其實是檔案總管的桌面（別的程式的視窗），
+// Edge 會丟掉這種滾輪訊息，右鍵也不可靠（縮放、轉動視角都沒反應），所以改成直接送給頁面。每個事件 data: {
+//   t: 'hello' | 'move' | 'down' | 'up' | 'wheel' | 'leave'（游標離開了桌面或這個螢幕，沒有按著鍵）,
+//   x, y：實體像素，相對於這個螢幕的左上角。播放器靠 /api/fit 把網頁內容區的左上角對齊螢幕的左上角，所以 ÷ devicePixelRatio 就是 clientX / clientY,
+//   b：down / up 的鍵（0 左鍵、2 右鍵）, dy：滾輪（一格 120，往下捲是正的，和 WheelEvent.deltaY 同方向）, k：現在按著的鍵（1 左、2 右） }，
+//   或 { t: 'wake' }：播放器的狀態（換了桌布、暫停、音效開關、語言）可能變了，叫 watchPlayer 馬上問一次（串流連著時它不留著長輪詢）。
+// 要送什麼由播放器決定（游標在桌面上、從桌面上按下去的、右鍵只給 rd=1 的螢幕……），這裡只換算成 f.mouse（Player.input，和 DOM 事件同一套規則）。
+// 串流開著的時候播放器不會再送 Win32 滑鼠訊息，這一頁也不理 DOM 的滑鼠事件（Player.extInput）。
+// 斷線（播放器重新啟動中、或太久沒收而被播放器踢掉）：改回 DOM 事件（播放器那邊也會改回 PostMessage），EventSource 自己會每隔幾秒重連。
+// 連線被拒絕（回的不是 200 的事件串流，EventSource 不會再連）：查一下狀態碼，4xx（舊版播放器沒有 /api/input → 404）就永遠用 DOM 事件；
+// 其他（例如播放器暫時出錯）隔一陣子再試，間隔每次加倍（最多 1 分鐘）
+const WHEEL_DOM = 100 / 120;   // 播放器的滾輪一格 120 → 瀏覽器 wheel 事件的一格（Windows 預設一次捲 3 行時 deltaY = 100）：縮放的手感和全螢幕預覽一樣
+function watchInput(wpid) {
+  const st = WP.input = { state: 'off', events: 0, opens: 0, errors: 0, status: 0, wakes: 0, busy: false };   // busy：被拒絕（503，太多螢幕）
+  if (typeof EventSource !== 'function') return;
+  const url = '/api/input?mon=' + encodeURIComponent(wpid);
+  let wait = 2000, leaving = false;
+  // 這一頁正在被換掉（重新載入、換桌布）：瀏覽器在 pagehide 之前就以錯誤關掉串流（readyState CLOSED）。
+  // 這時不查狀態、不重連，不然查狀態的請求在播放器那邊會變成一條多出來的連線（要約 0.5 秒才發現它關了）
+  window.addEventListener('pagehide', () => { leaving = true; });
+  window.addEventListener('pageshow', () => { leaving = false; });
+  // 串流連上 / 被拒絕 / 斷掉時叫 watchPlayer 換方式（連著：等 wake 才問；被拒絕：每 3 秒問；其他：長輪詢）。
+  // 斷掉時稍等一下：頁面正在被換掉的話不要再發出請求
+  const mode = () => st.state === 'live' ? 2 : st.busy ? 1 : 0;
+  const setState = (s, busy = st.busy) => {
+    const was = mode();
+    st.state = s; st.busy = busy;
+    const now = mode();
+    if (was === now) return;
+    if (was !== 2) { if (WP.wake) WP.wake(); }
+    else setTimeout(() => { if (!leaving && WP.wake) WP.wake(); }, 250);
+  };
+  const use = on => {
+    const p = WP.player;
+    if (!p || p.extInput === on) return;
+    p.extInput = on;
+    if (!on) { p.mouse.down = false; p.mouse.rdown = false; }   // 斷線時按著的鍵不知道什麼時候放開：當作放開了（之後由 DOM 事件接手）
+  };
+  const uiAt = (x, y) => Number.isFinite(x) && Number.isFinite(y) && onUiEl(document.elementFromPoint(x, y));
+  const feed = d => {
+    const p = WP.player;
+    if (!p || !d || typeof d.t !== 'string') return;
+    st.events++;
+    if (d.t === 'hello') { st.v = d.v; return; }
+    if (d.t === 'wake') { st.wakes++; if (WP.wake) WP.wake(); return; }
+    const r = window.devicePixelRatio || 1, x = Number(d.x) / r, y = Number(d.y) / r;
+    const b = d.b === 2 ? 2 : d.b === 0 ? 0 : -1, k = typeof d.k === 'number' ? d.k : undefined;
+    if (d.t === 'move' || d.t === 'leave') p.input(d.t, x, y, 0, 0, false, k);
+    else if (d.t === 'down') p.input('down', x, y, b, 0, uiAt(x, y));
+    else if (d.t === 'up') p.input('up', x, y, b, 0, false, k);
+    else if (d.t === 'wheel') p.input('wheel', x, y, 0, (Number(d.dy) || 0) * WHEEL_DOM, false, k);
+  };
+  // 連線被拒絕的原因：false = 不用再試（4xx，例如舊版播放器的 404；或回的根本不是事件串流）
+  const retryable = async () => {
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    try {
+      const r = await fetch(url, { cache: 'no-store', signal: ctl ? ctl.signal : undefined });
+      st.status = r.status;
+      if (r.status >= 400 && r.status < 500) return false;
+      return !r.ok || /^text\/event-stream/i.test(r.headers.get('content-type') || '');
+    } catch (e) { st.status = 0; return true; }   // 連不上：播放器重新啟動中
+    finally { if (ctl) ctl.abort(); }
+  };
+  const connect = () => {
+    setState('connecting');
+    const es = new EventSource(url);
+    es.onopen = () => { st.opens++; wait = 2000; use(true); setState('live', false); };
+    es.onmessage = e => { let d = null; try { d = JSON.parse(e.data); } catch (err) { return; } feed(d); };
+    es.onerror = () => {
+      st.errors++;
+      use(false);
+      if (es.readyState !== EventSource.CLOSED) { setState('connecting'); return; }   // 斷線了：EventSource 自己會再連
+      setState('checking');
+      // 稍等一下再查：頁面正在被換掉的話，到時候舊頁面已經卸載（計時器不會執行）或已經收到 pagehide
+      setTimeout(() => {
+        if (leaving) return;
+        retryable().then(again => {
+          if (!again) { setState('dom', false); return; }   // 永遠用 DOM 事件
+          setState('waiting', st.status === 503);
+          setTimeout(connect, wait); wait = Math.min(wait * 2, 60000);
+        });
+      }, 250);
+    };
+  };
+  connect();
 }
 function legacyVersionPoll(wpid, v0) {
   const poll = async () => {
@@ -43225,9 +43523,11 @@ async function startWallpaper(cfg) {
   // 由 ASCII桌布播放器載入時：視窗標題當作識別碼，播放器換桌布時自動重新載入
   const wpid = new URLSearchParams(location.hash.slice(1)).get('wpid');
   if (wpid && location.origin === PLAYER_ORIGIN) {
+    WP.hosted = true;
     document.title = 'ASCIIWP-' + wpid;
     const served = document.querySelector('meta[name="wp-version"]');
     watchPlayer(wpid, served ? served.content : null);
+    watchInput(wpid);   // 滑鼠：播放器直接送來的事件串流（舊版播放器沒有：照舊用 DOM 事件）
     // 回報 Edge 自己畫的標題列和邊框有多大（DIP），播放器據此把網頁內容區剛好對齊螢幕、裁掉標題列
     let fitTimer = 0;
     const reportFit = () => {
@@ -43239,7 +43539,8 @@ async function startWallpaper(cfg) {
   }
   if (cfg.source.type === 'playlist') {
     p.setOpts({ fps: (cfg.opts && cfg.opts.fps) || 30 });
-    WP.rot = new Rotator(p, cfg.source, it => syncScan(vw, it.opts && it.opts.scan));
+    // 換到要不要右鍵拖曳不一樣的動畫：馬上告訴播放器（WP.rdSync）
+    WP.rot = new Rotator(p, cfg.source, it => { syncScan(vw, it.opts && it.opts.scan); if (WP.rdSync) WP.rdSync(); });
     await WP.rot.next();
   } else await applyCfgToPlayer(p, cfg);
 }

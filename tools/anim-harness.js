@@ -10,6 +10,7 @@
 //   src-anims/zz-i18n-en.js 只登記英文名稱（沒有任何動畫），單獨測它就是 0 個桌布。
 // 檢查：註冊格式、執行錯誤、字元/顏色格式、效能、是否空白、是否有動、同一個基本動畫的變化款是否太像。
 // 互動桌布（interactive: true）另外用模擬的滑鼠玩一輪：閒置 → 移動、點擊、按住拖曳、滾輪 → 再閒置。
+// 要右鍵拖曳的桌布（rightDrag: true，基本動畫或變化款）玩的時候另外會按住右鍵移動（f.mouse.rdown，例如轉動 3D 視角）。
 // 音效：f.sfx 用了不存在的種類（見核心的 Sfx.KINDS）、傳了不是有限數字的參數，或 3D 位置 {x, y, z} 裡有不是有限數字的就 FAIL；
 //       平均每秒超過 12 個音效就 WARN。第三個參數可以是左右（-1–1 的數字）或 3D 位置 {x, y, z}（公尺）。
 // 結束代碼：有任何 FAIL 就是 1。
@@ -111,6 +112,7 @@ for (const b of ctx.BASES) {
     const e = Object.create(b);
     Object.assign(e, { base: b, id, name: v ? b.name + '・' + v.name : b.name, theme: (v && v.theme) || b.theme,
       hue: v && v.hue !== undefined ? v.hue : b.hue, params: Object.assign({}, b.params || {}, v && v.params), sound: v && v.sound !== undefined ? v.sound : b.sound,
+      rightDrag: v && v.rightDrag !== undefined ? v.rightDrag : b.rightDrag,
       variantParams: v ? v.params || {} : null, file, testing });
     entries.push(e);
   }
@@ -118,10 +120,11 @@ for (const b of ctx.BASES) {
 }
 
 // ── 執行測試 ──
-// 和頁面裡 Player 一樣的滑鼠資料：x/y（格子座標）、on、moved、down、clicks（這一格之間的點擊）、wheel、idle（距離上次操作幾秒）
-const newMouse = () => ({ x: 0, y: 0, on: false, moved: false, down: false, clicks: [], wheel: 0, idle: Infinity, last: -Infinity });
-// 模擬玩家：前 1/4 閒置，中間一半在畫面上移動、點擊、按住拖曳、捲動，最後 1/4 又閒置
-function simInput(m, k, frames, cols, rows, t) {
+// 和頁面裡 Player 一樣的滑鼠資料：x/y（格子座標）、on、moved、down、rdown（右鍵按著）、clicks（這一格之間的點擊）、wheel、idle（距離上次操作幾秒）
+const newMouse = () => ({ x: 0, y: 0, on: false, moved: false, down: false, rdown: false, clicks: [], wheel: 0, idle: Infinity, last: -Infinity });
+// 模擬玩家：前 1/4 閒置，中間一半在畫面上移動、點擊、按住拖曳、捲動，最後 1/4 又閒置。
+// rd（要右鍵拖曳的桌布）：另外每 40 格按住右鍵移動一段（和左鍵的拖曳錯開），其他桌布的 rdown 永遠是 false（和頁面一樣）
+function simInput(m, k, frames, cols, rows, t, rd) {
   const a = frames * 0.25, b = frames * 0.75;
   if (k >= a && k < b) {
     const u = (k - a) / (b - a);
@@ -129,8 +132,9 @@ function simInput(m, k, frames, cols, rows, t) {
     m.moved = nx !== m.x || ny !== m.y; m.x = nx; m.y = ny; m.on = true; m.last = t;
     if (k % 11 === 0) m.clicks.push({ x: m.x, y: m.y, button: 0 });
     m.down = (k % 40) >= 25 && (k % 40) < 34;          // 每 40 格按住一小段時間（拖曳）
+    if (rd) m.rdown = (k % 40) >= 4 && (k % 40) < 18;  // 右鍵拖曳（轉動視角）
     if (k % 37 === 0) m.wheel += 120;
-  } else m.down = false;
+  } else { m.down = false; m.rdown = false; }
   m.idle = t - m.last;
 }
 function run(e, cols, rows, frames, snapAt, play) {
@@ -160,7 +164,7 @@ function run(e, cols, rows, frames, snapAt, play) {
   let prevCh = null, prevCo = null;
   for (let k = 0; k < frames; k++) {
     f.t += f.dt; f.bg = null;
-    if (play) simInput(f.mouse, k, frames, cols, rows, f.t);
+    if (play) simInput(f.mouse, k, frames, cols, rows, f.t, !!e.rightDrag);
     else f.mouse.idle = Infinity;
     if (!e.keep) g.clear();
     const t0 = process.hrtime.bigint();
@@ -215,8 +219,8 @@ for (const e of entries) {
     else if (r.fill < 1.5) warn(r, `很稀疏：平均只有 ${r.fill}% 的格子有字（確定這是想要的樣子嗎？）`);
     if (r.activeFrames < 30) fail(r, `幾乎不動：只有 ${r.activeFrames}% 的畫格有變化`);
     if (avg(small.fill) * 100 < 1) warn(r, `小尺寸（100×28）幾乎空白：${(avg(small.fill) * 100).toFixed(1)}%`);
-    if (e.interactive) {
-      // 用模擬的滑鼠玩一輪（大、小兩種尺寸）：不能出錯、不能太慢、玩的時候也不能變成一片空白
+    if (e.interactive || e.rightDrag) {
+      // 用模擬的滑鼠玩一輪（大、小兩種尺寸）：不能出錯、不能太慢、玩的時候也不能變成一片空白（rightDrag 的桌布也會右鍵拖曳）
       const playBig = run(e, 320, 88, 240, -1, true), playSmall = run(e, 100, 28, 240, 150, true);
       runs.push(playBig, playSmall);
       const pt = playBig.times.slice(5);

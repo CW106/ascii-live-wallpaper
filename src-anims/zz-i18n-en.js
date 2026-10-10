@@ -160,7 +160,7 @@
       "ga-timer": {"name":"Calendar & Timers","desc":"A big calendar with today marked, flanked by the previous and next months"},
       "ga-skyline": {"name":"City Skyline","desc":"A city passes through a whole day, from daylight to night"},
       "ga-scene": {"name":"Little Scenes","desc":"A clifftop lighthouse sweeps its beam across the night sea"},
-      "cradle3d": {"name":"3D Newton's Cradle","desc":"A metal cradle as the camera slowly roams; pull a ball out and let go, scroll to zoom"},
+      "cradle3d": {"name":"3D Newton's Cradle","desc":"A metal cradle as the camera roams; pull a ball out, right-drag to turn, scroll to zoom"},
       "ix-whack": {"name":"Whack-a-Mole","desc":"Click moles as they pop up; hit streaks multiply your score; it plays itself when idle"},
       "ix-breakout": {"name":"Brick Smasher","desc":"Move the mouse to steer the paddle and click to serve; knock down the whole brick wall"},
       "ix-pong": {"name":"Paddle Duel","desc":"Move the mouse up and down to steer the right paddle against the computer; first to 7 wins"},
