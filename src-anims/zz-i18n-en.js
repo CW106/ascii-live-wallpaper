@@ -188,6 +188,7 @@
       "ix-rain": {"name":"Digital Rain Umbrella","desc":"Digital rain parts around the cursor as if it were an umbrella; click to ripple drops away"},
       "ix-paint": {"name":"Neon Doodle","desc":"Move the mouse to draw glowing neon lines that fade and change color; hold for thick lines"},
       "ix-fog": {"name":"Foggy Window","desc":"Hold the mouse button to draw on the fogged glass and see outside; scroll for finger size"},
+      "px-fog": {"name":"Foggy Window · Realistic","desc":"Hold the mouse button to wipe the fog and see the night city; scroll for finger size"},
     },
     variants: {
       "matrix.hex": {"name":"Hex Rain","desc":"Columns of two-digit hexadecimal bytes rain down"},
@@ -1072,6 +1073,8 @@
       "ix-paint.mirror": {"name":"Kaleidoscope","desc":"Every stroke is mirrored six ways around the center of the screen"},
       "ix-fog.snow": {"name":"Snowy Dawn","desc":"A snowy forest and cabin at dawn: hold the mouse button to draw, scroll for finger size"},
       "ix-fog.rain": {"name":"Rainy Corner","desc":"Neon and headlights blur in the fog on a rainy street: hold to draw; more drops run down"},
+      "px-fog.snow": {"name":"Snowy Dawn","desc":"Snowy peaks, pines and a lit cabin at dawn: hold to draw on the fog, scroll for size"},
+      "px-fog.rain": {"name":"Rainy Corner","desc":"Neon mirrored on a wet street: hold to draw, more drops run down; scroll for finger size"},
     },
   });
 })();

@@ -13,6 +13,8 @@
 // 要右鍵拖曳的桌布（rightDrag: true，基本動畫或變化款）玩的時候另外會按住右鍵移動（f.mouse.rdown，例如轉動 3D 視角）。
 // 音效：f.sfx 用了不存在的種類（見核心的 Sfx.KINDS）、傳了不是有限數字的參數，或 3D 位置 {x, y, z} 裡有不是有限數字的就 FAIL；
 //       平均每秒超過 12 個音效就 WARN。第三個參數可以是左右（-1–1 的數字）或 3D 位置 {x, y, z}（公尺）。
+// 像素動畫（pixel: 'gl' / '2d'，直接畫整張畫布，需要瀏覽器）：這裡只檢查註冊格式（id、名稱、說明、分類、pixel 的值、變化款不能只換顏色），
+//   另外計數；實際執行請用 node tools/pixel-harness.js <id>（headless Edge）。
 // 結束代碼：有任何 FAIL 就是 1。
 const fs = require('fs');
 const path = require('path');
@@ -69,6 +71,8 @@ const warn = (entry, msg) => { entry.warns.push(msg); };
 const ID_RE = /^[a-z][a-z0-9-]*$/;
 const COLOR_RE = /^#([0-9a-f]{6}|[0-9a-f]{3})$/i;
 const cats = ctx.CATS.filter(c => c !== '全部');
+// 像素動畫的種類：只有 pixel: 'gl' 或 '2d' 這兩個字串算數（和頁面的 pxKind 一樣；有的字元動畫自己有叫 pixel 的方法，例如經典的 fire）
+const pxKind = b => (b && (b.pixel === 'gl' || b.pixel === '2d') ? b.pixel : null);
 const testedFiles = new Set(modules.map(p => path.basename(p)));
 
 // ── 註冊格式與攤平（和頁面裡的 buildRegistry 相同規則） ──
@@ -84,6 +88,16 @@ for (const b of ctx.BASES) {
   if (!ctx.THEME_IDS.includes(b.theme)) fail(reg, `theme 必須是 ${ctx.THEME_IDS.join('、')} 之一，現在是 ${b.theme}`);
   if (typeof b.frame !== 'function') fail(reg, '缺少 frame()');
   if (!b.desc) warn(reg, '缺少 desc');
+  // 像素動畫：pixel 只能是 'gl' 或 '2d'，一定要有 init()（建立 GL 資源），dispose 要是函式；變化款不能改 pixel。
+  // 動畫自己的方法剛好叫 pixel（函式）不算，照字元動畫處理
+  if (b.pixel !== undefined && typeof b.pixel !== 'function') {
+    if (!pxKind(b)) fail(reg, `pixel 必須是 'gl' 或 '2d'，現在是 ${JSON.stringify(b.pixel)}`);
+    if (typeof b.init !== 'function') fail(reg, '像素動畫缺少 init()');
+    if (b.dispose !== undefined && typeof b.dispose !== 'function') fail(reg, 'dispose 必須是函式');
+    if (b.pixel === 'gl' && typeof b.dispose !== 'function') warn(reg, '像素動畫（gl）沒有 dispose()：換動畫時 GL 資源不會釋放');
+    if (b.cat !== '寫實') warn(reg, `像素動畫的分類建議用 寫實，現在是 ${b.cat}`);
+    if (b.keep) warn(reg, '像素動畫不用 keep（核心本來就不清畫布）');
+  }
   if (b.sound !== undefined && typeof b.sound !== 'boolean') fail(reg, `sound 必須是 true 或 false，現在是 ${b.sound}`);
   const vs = b.variants || [];
   // 精選刪減後有些系列只剩少數變化款，這是正常的；只提醒變化款多到難以區分的情況
@@ -100,6 +114,7 @@ for (const b of ctx.BASES) {
       if (v.theme && !ctx.THEME_IDS.includes(v.theme)) fail(reg, `變化款 ${v.id} 的 theme 不存在：${v.theme}`);
       if (v.cat && !cats.includes(v.cat)) fail(reg, `變化款 ${v.id} 的 cat 不對：${v.cat}`);
       if (v.sound !== undefined && typeof v.sound !== 'boolean') fail(reg, `變化款 ${v.id} 的 sound 必須是 true 或 false`);
+      if (v.pixel !== undefined && typeof v.pixel !== 'function') fail(reg, `變化款 ${v.id} 不能改 pixel（只能寫在基本動畫上）`);
     }
     if (seen.has(id)) fail(reg, `id 和 ${seen.get(id)} 重複：${id}`);
     seen.set(id, file);
@@ -113,8 +128,13 @@ for (const b of ctx.BASES) {
     Object.assign(e, { base: b, id, name: v ? b.name + '・' + v.name : b.name, theme: (v && v.theme) || b.theme,
       hue: v && v.hue !== undefined ? v.hue : b.hue, params: Object.assign({}, b.params || {}, v && v.params), sound: v && v.sound !== undefined ? v.sound : b.sound,
       rightDrag: v && v.rightDrag !== undefined ? v.rightDrag : b.rightDrag,
-      variantParams: v ? v.params || {} : null, file, testing });
+      variantParams: v ? v.params || {} : null, file, testing, pixel: pxKind(b) });
     entries.push(e);
+  }
+  // 像素動畫：變化款只換顏色（params 空的）的比例不能超過 30%（和下面字元動畫的規則一樣，但這裡沒有畫面可以比較）
+  if (testing && pxKind(b) && vs.length) {
+    const colourOnly = vs.filter(v => !v.params || Object.keys(v.params).length === 0);
+    if (colourOnly.length / vs.length > 0.3) fail(reg, `${b.id} 有 ${colourOnly.length}/${vs.length} 個變化款沒有自己的 params（上限 30%），請讓變化款的參數真的不一樣`);
   }
   if (testing && (reg.fails.length || reg.warns.length)) results.push({ id: b.id + '（註冊）', file, status: reg.fails.length ? 'FAIL' : 'WARN', fails: reg.fails, warns: reg.warns });
 }
@@ -202,6 +222,8 @@ for (const e of entries) {
   if (!e.testing) continue;
   if (only && !e.id.startsWith(only)) continue;
   const r = { id: e.id, name: e.name, file: e.file, fails: [], warns: [] };
+  // 像素動畫要瀏覽器才能跑：只算數，請用 tools/pixel-harness.js 測
+  if (e.pixel) { r.pixel = e.pixel; r.status = 'OK'; results.push(r); continue; }
   try {
     const big = run(e, 320, 88, 150, -1);
     const small = run(e, 100, 28, 125, 120);
@@ -285,7 +307,8 @@ if (wantSnap) {
 }
 const bad = results.filter(r => r.status === 'FAIL');
 const warns = results.filter(r => r.status === 'WARN');
-const tested = results.filter(r => !r.id.endsWith('（註冊）'));
+const pixels = results.filter(r => r.pixel);
+const tested = results.filter(r => !r.id.endsWith('（註冊）') && !r.pixel);
 for (const r of results) {
   if (r.status === 'OK') continue;
   console.log(`[${r.status}] ${r.id}${r.name ? '「' + r.name + '」' : ''}`);
@@ -295,6 +318,7 @@ for (const r of results) {
 const perFile = {};
 for (const r of tested) perFile[r.file] = (perFile[r.file] || 0) + 1;
 console.log(`\n測試 ${tested.length} 個桌布（${Object.entries(perFile).map(([f, n]) => f + ' ' + n).join('，')}）${lang ? `［f.lang = ${lang}］` : ''}：FAIL ${bad.length}，WARN ${warns.length}`);
+if (pixels.length) console.log(`像素動畫 ${pixels.length} 個（${pixels.map(r => r.id).join('，')}）只檢查了註冊格式；實際執行請用 node tools/pixel-harness.js <id>（headless Edge）`);
 if (tested.length) {
   const slow = tested.filter(r => r.avgMs !== undefined).sort((a, b) => b.avgMs - a.avgMs).slice(0, 5);
   console.log('最慢：' + slow.map(r => `${r.id} ${r.avgMs}ms`).join('，'));
